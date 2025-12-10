@@ -1,6 +1,6 @@
 # Seekcamera Glass Detector
 
-A thermal imaging application for detecting hot objects using Seek Thermal cameras with advanced contrast enhancement and real-time temperature tracking.
+A thermal imaging application for detecting glass using Seek Thermal cameras and a heat source. Leverages the reflective properties of glass in thermal imaging—detecting glass surfaces by identifying reflected heat sources.
 
 ## Features
 
@@ -100,13 +100,6 @@ User controls:
 - Crosshair turns **green** when temperature ≥ threshold
 - Sidebar shows real-time temperature and color indicator
 
-### Color Palette
-- **Click anywhere** on the thermal image to cycle through color palettes:
-  - **SPECTRA** (default) - Green/Yellow/Red for maximum contrast
-  - **WHITE_HOT** - Grayscale for scientific analysis
-  - **TYRIAN** - Purple/Orange for general use
-  - **IRON** - Classic thermal imaging colors
-
 ### Quit
 - Press **Q** to exit the application
 
@@ -159,39 +152,6 @@ Edit these constants in `src/seekcamera-glass-detector.cpp`:
 const int MIN_OBJECT_SIZE = 15;        // Minimum pixels for detection
 const int SIDEBAR_WIDTH = 300;         // Sidebar width in pixels
 const float PLATEAU_LIMIT = 2.5f;      // CLAHE contrast clipping threshold
-```
-
-## Troubleshooting
-
-### Camera Not Detected
-```bash
-# Check USB connection
-lsusb | grep Seek
-
-# Check permissions (Linux)
-sudo chmod 666 /dev/bus/usb/*/[device-number]
-```
-
-### Build Errors - Path Too Long (Windows)
-Move project to shorter path:
-```bash
-# Instead of: C:/Users/.../very/long/path/seekcamera-glass-detector
-# Use: C:/Projects/thermal-tracker
-```
-
-### SDL2 Not Found
-Update CMakeLists.txt with correct SDL2 paths or set environment variable:
-```bash
-export SDL2_DIR=/path/to/SDL2
-```
-
-### DLLs Missing (Windows)
-CMake automatically copies DLLs to build directory. If missing:
-```bash
-cd build/Release
-cp C:/SDL2-2.32.10/lib/x64/SDL2.dll .
-cp C:/SDL2_ttf-2.24.0/lib/x64/SDL2_ttf.dll .
-cp [SDK_PATH]/lib/seekcamera.dll .
 ```
 
 ## Project Structure
@@ -259,12 +219,3 @@ For issues related to:
 - **Seek SDK**: Visit [Seek Thermal Developer Center](https://www.thermal.com/developer-center.html)
 - **This Application**: Open an issue on GitHub
 - **Camera Hardware**: Contact Seek Thermal support
-
-## Version History
-
-- **v1.0.0** - Initial release with CLAHE histogram equalization
-  - Dynamic temperature threshold (20-100°C)
-  - Real-time object detection and tracking
-  - Interactive crosshair with temperature readout
-  - Multiple color palette support
-  - Compact sidebar UI
