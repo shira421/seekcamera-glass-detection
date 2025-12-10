@@ -127,6 +127,8 @@ User controls:
 └─────────────────────────────────────┴──────────────────┘
 ```
 
+<img width="1411" height="765" alt="image" src="https://github.com/user-attachments/assets/2533b53e-d10a-4018-97b4-ab8adfc1c258" />
+
 ## Algorithm Details
 
 ### CLAHE Histogram Equalization
@@ -195,6 +197,8 @@ cmake --build . --config Release
 ```
 
 ## Technical Specifications
+
+<img width="1050" height="590" alt="image" src="https://github.com/user-attachments/assets/8a37b9be-d667-4fbb-92a5-d4c4ee83f7db" />
 
 - **Frame Rate**: ~30 FPS on 320×240 thermal sensor
 - **Temperature Range**: Depends on camera model (typically -40°C to 330°C)
