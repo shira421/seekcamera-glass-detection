@@ -1,6 +1,6 @@
 /*
- * Thermal Object Tracker - Enhanced Contrast Version
- * High-contrast thermal imaging with vibrant color gradients
+ * Thermal Object Tracker - Custom Color Mapping
+ * Maps raw temperature data to custom colors with steep gradient
  */
 
 #include <csignal>
@@ -32,7 +32,7 @@
 #include "seekcamera/seekcamera_manager.h"
 #include "seekframe/seekframe.h"
 
- // Thermal Object structure (direction removed)
+ // Thermal Object structure
 struct ThermalObject {
     int id;
     int x, y, width, height;
@@ -83,83 +83,59 @@ static std::atomic<bool> g_is_dirty;
 const int MIN_OBJECT_SIZE = 15;
 const int SIDEBAR_WIDTH = 300;
 
-// Histogram equalization parameters
-const int HIST_SIZE = 256;
-const float PLATEAU_LIMIT = 2.5f;  // Clip limit for contrast
-
-// Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-// This is what creates the dramatic gradients in Seek Compact app
-void enhanceContrast(float* temps, int width, int height) {
-    int total_pixels = width * height;
-
-    // Find min and max temperatures
-    float min_temp = 1000.0f;
-    float max_temp = -1000.0f;
-    for (int i = 0; i < total_pixels; i++) {
-        min_temp = std::min(min_temp, temps[i]);
-        max_temp = std::max(max_temp, temps[i]);
-    }
+// CUSTOM COLOR MAPPING - Ultra steep gradient relative to frame
+// This bypasses hardware palette completely!
+SDL_Color mapTemperatureToColor(float temp, float min_temp, float max_temp) {
+    SDL_Color color;
 
     float range = max_temp - min_temp;
-    if (range < 0.1f) return;  // Not enough temperature variation
-
-    // Build histogram
-    int histogram[HIST_SIZE] = { 0 };
-    for (int i = 0; i < total_pixels; i++) {
-        float normalized = (temps[i] - min_temp) / range;
-        int bin = std::min((int)(normalized * (HIST_SIZE - 1)), HIST_SIZE - 1);
-        histogram[bin]++;
+    if (range < 0.01f) {
+        // Uniform temperature - show as dark
+        color.r = 20; color.g = 20; color.b = 20; color.a = 255;
+        return color;
     }
 
-    // Apply plateau clipping (contrast limited)
-    int clip_limit = (int)(PLATEAU_LIMIT * total_pixels / HIST_SIZE);
-    int clipped_pixels = 0;
+    // Normalize temperature relative to THIS frame
+    float normalized = (temp - min_temp) / range;
 
-    for (int i = 0; i < HIST_SIZE; i++) {
-        if (histogram[i] > clip_limit) {
-            clipped_pixels += (histogram[i] - clip_limit);
-            histogram[i] = clip_limit;
-        }
+    // Apply STEEP power curve
+    normalized = std::pow(normalized, 0.15f);  // Very steep!
+
+    // Map to vibrant gradient: Blue -> Cyan -> Green -> Yellow -> Red
+    if (normalized < 0.25f) {
+        // Blue to Cyan
+        float t = normalized * 4.0f;
+        color.r = 0;
+        color.g = (Uint8)(t * 255);
+        color.b = 255;
+    }
+    else if (normalized < 0.5f) {
+        // Cyan to Green
+        float t = (normalized - 0.25f) * 4.0f;
+        color.r = 0;
+        color.g = 255;
+        color.b = (Uint8)((1.0f - t) * 255);
+    }
+    else if (normalized < 0.75f) {
+        // Green to Yellow
+        float t = (normalized - 0.5f) * 4.0f;
+        color.r = (Uint8)(t * 255);
+        color.g = 255;
+        color.b = 0;
+    }
+    else {
+        // Yellow to Red
+        float t = (normalized - 0.75f) * 4.0f;
+        color.r = 255;
+        color.g = (Uint8)((1.0f - t) * 255);
+        color.b = 0;
     }
 
-    // Redistribute clipped pixels evenly
-    int redistribution = clipped_pixels / HIST_SIZE;
-    int residual = clipped_pixels % HIST_SIZE;
-    for (int i = 0; i < HIST_SIZE; i++) {
-        histogram[i] += redistribution;
-        if (i < residual) histogram[i]++;
-    }
-
-    // Build cumulative distribution function (CDF)
-    int cdf[HIST_SIZE];
-    cdf[0] = histogram[0];
-    for (int i = 1; i < HIST_SIZE; i++) {
-        cdf[i] = cdf[i - 1] + histogram[i];
-    }
-
-    // Find CDF min (first non-zero value)
-    int cdf_min = cdf[0];
-    for (int i = 0; i < HIST_SIZE; i++) {
-        if (cdf[i] > 0) {
-            cdf_min = cdf[i];
-            break;
-        }
-    }
-
-    // Apply histogram equalization
-    for (int i = 0; i < total_pixels; i++) {
-        float normalized = (temps[i] - min_temp) / range;
-        int bin = std::min((int)(normalized * (HIST_SIZE - 1)), HIST_SIZE - 1);
-
-        // Equalize using CDF
-        float equalized = (float)(cdf[bin] - cdf_min) / (total_pixels - cdf_min);
-
-        // Map back to temperature range with aggressive stretching
-        temps[i] = min_temp + (equalized * range);
-    }
+    color.a = 255;
+    return color;
 }
 
-// Get color based on temperature (gradient from yellow to dark red)
+// Get color based on temperature (for bounding boxes)
 SDL_Color getTemperatureColor(float temp, float min_threshold, float max_range) {
     SDL_Color color;
 
@@ -304,7 +280,7 @@ std::vector<ThermalObject> detectHotObjects(float* temps, int width, int height,
     return objects;
 }
 
-// Draw bounding box (no direction arrow)
+// Draw bounding box
 void drawThermalObject(SDL_Renderer* renderer, TTF_Font* font, const ThermalObject& obj, int scale_factor) {
     SDL_Rect box;
     box.x = obj.x * scale_factor;
@@ -326,7 +302,7 @@ void drawThermalObject(SDL_Renderer* renderer, TTF_Font* font, const ThermalObje
         SDL_RenderDrawRect(renderer, &border);
     }
 
-    // Draw text label (temperature only)
+    // Draw text label
     if (font) {
         std::stringstream ss;
         ss << std::fixed << std::setprecision(1) << obj.avg_temp << " C";
@@ -401,7 +377,7 @@ void renderTextLine(SDL_Renderer* renderer, TTF_Font* font, const char* text, in
     }
 }
 
-// Draw sidebar (no direction info)
+// Draw sidebar
 void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_small,
     const std::vector<ThermalObject>& objects, float center_temp,
     int center_x_thermal, int center_y_thermal, float& user_threshold,
@@ -502,7 +478,7 @@ void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_small,
     renderTextLine(renderer, font_small, status_text, sidebar_x + 10, y_pos, white);
     y_pos += 25;
 
-    // Targeted Object (no direction)
+    // Targeted Object
     if (targeted_object != NULL) {
         SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
         SDL_RenderDrawLine(renderer, sidebar_x + 10, y_pos, sidebar_x + SIDEBAR_WIDTH - 10, y_pos);
@@ -572,9 +548,6 @@ void handle_camera_frame_available(seekcamera_t* camera, seekcamera_frame_t* cam
         int height = seekframe_get_height(thermal_frame);
 
         if (temps && width > 0 && height > 0) {
-            // Apply contrast enhancement for vibrant gradients!
-            enhanceContrast(temps, width, height);
-
             renderer->detected_objects = detectHotObjects(temps, width, height,
                 renderer->next_object_id,
                 renderer->user_temp_threshold);
@@ -609,8 +582,8 @@ void handle_camera_connect(seekcamera_t* camera, seekcamera_error_t event_status
         return;
     }
 
-    // Use SPECTRA palette for MAXIMUM vibrant colors (green/yellow/red)
-    status = seekcamera_set_color_palette(camera, SEEKCAMERA_COLOR_PALETTE_SPECTRA);
+    // Use WHITE_HOT as base - we'll override with custom colors anyway
+    status = seekcamera_set_color_palette(camera, SEEKCAMERA_COLOR_PALETTE_WHITE_HOT);
     if (status != SEEKCAMERA_SUCCESS) {
         std::cerr << "Failed to set color palette: " << seekcamera_error_get_str(status) << std::endl;
     }
@@ -736,13 +709,14 @@ int main() {
     signal(SIGINT, signal_callback);
     signal(SIGTERM, signal_callback);
 
-    std::cout << "Thermal Object Tracker - Histogram Equalization" << std::endl;
-    std::cout << "===============================================" << std::endl;
+    std::cout << "Thermal Object Tracker - Custom Color Mapping" << std::endl;
+    std::cout << "==============================================" << std::endl;
     std::cout << "Features:" << std::endl;
-    std::cout << "- CLAHE (Contrast Limited Adaptive Histogram Equalization)" << std::endl;
-    std::cout << "- SPECTRA palette: Dramatic GREEN/YELLOW/RED gradients" << std::endl;
-    std::cout << "- Same algorithm used in Seek Compact app!" << std::endl;
-    std::cout << "- Hot spots will POP with vibrant colors" << std::endl;
+    std::cout << "- CUSTOM color mapping bypasses hardware palette!" << std::endl;
+    std::cout << "- Ultra-steep gradient relative to frame temps" << std::endl;
+    std::cout << "- Blue (cool) -> Cyan -> Green -> Yellow -> Red (hot)" << std::endl;
+    std::cout << "- Hot spots will POP even on uniform glass" << std::endl;
+    std::cout << "- Power curve 0.15 for extreme steepness" << std::endl;
     std::cout << "- Drag slider (20-100 C) to set detection threshold" << std::endl;
     std::cout << "\nPress 'q' to quit\n" << std::endl;
 
@@ -786,7 +760,7 @@ int main() {
                     memset(&cid, 0, sizeof(cid));
                     seekcamera_get_chipid(renderer->camera, &cid);
                     std::stringstream window_title;
-                    window_title << "Thermal Object Tracker - Enhanced (CID: " << cid << ")";
+                    window_title << "Thermal Object Tracker - Custom Colors (CID: " << cid << ")";
 
                     renderer->window = SDL_CreateWindow(window_title.str().c_str(), 100, 100, 0, 0, SDL_WINDOW_HIDDEN);
                     renderer->renderer = SDL_CreateRenderer(renderer->window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
@@ -807,18 +781,19 @@ int main() {
 
                     if (renderer->is_dirty.load() && renderer->frame != nullptr && renderer->is_active.load()) {
 
-                        seekframe_t* frame = nullptr;
+                        // Get RAW THERMOGRAPHY DATA
+                        seekframe_t* thermal_frame = nullptr;
                         status = seekcamera_frame_get_frame_by_format(renderer->frame,
-                            SEEKCAMERA_FRAME_FORMAT_COLOR_ARGB8888,
-                            &frame);
+                            SEEKCAMERA_FRAME_FORMAT_THERMOGRAPHY_FLOAT,
+                            &thermal_frame);
                         if (status != SEEKCAMERA_SUCCESS) {
                             seekcamera_frame_unlock(renderer->frame);
                             continue;
                         }
 
-                        const int frame_width = (int)seekframe_get_width(frame);
-                        const int frame_height = (int)seekframe_get_height(frame);
-                        const int frame_stride = (int)seekframe_get_line_stride(frame);
+                        const int frame_width = (int)seekframe_get_width(thermal_frame);
+                        const int frame_height = (int)seekframe_get_height(thermal_frame);
+                        float* temps = (float*)seekframe_get_data(thermal_frame);
 
                         if (renderer->texture == nullptr) {
                             const int scale_factor = 2;
@@ -827,15 +802,40 @@ int main() {
 
                             SDL_RenderSetLogicalSize(renderer->renderer, window_width, window_height);
                             renderer->texture = SDL_CreateTexture(renderer->renderer, SDL_PIXELFORMAT_ARGB8888,
-                                SDL_TEXTUREACCESS_TARGET, frame_width, frame_height);
+                                SDL_TEXTUREACCESS_STREAMING, frame_width, frame_height);
                             SDL_SetWindowSize(renderer->window, window_width, window_height);
                             SDL_ShowWindow(renderer->window);
                         }
 
+                        // CUSTOM COLOR MAPPING - bypass hardware palette!
+                        // Find min/max temps in frame
+                        float min_temp = 1000.0f;
+                        float max_temp = -1000.0f;
+                        for (int i = 0; i < frame_width * frame_height; i++) {
+                            min_temp = std::min(min_temp, temps[i]);
+                            max_temp = std::max(max_temp, temps[i]);
+                        }
+
+                        // Create custom colored image
+                        Uint32* pixels;
+                        int pitch;
+                        SDL_LockTexture(renderer->texture, nullptr, (void**)&pixels, &pitch);
+
+                        for (int y = 0; y < frame_height; y++) {
+                            for (int x = 0; x < frame_width; x++) {
+                                float temp = temps[y * frame_width + x];
+                                SDL_Color color = mapTemperatureToColor(temp, min_temp, max_temp);
+
+                                // Convert to ARGB8888
+                                Uint32 pixel = (255 << 24) | (color.r << 16) | (color.g << 8) | color.b;
+                                pixels[y * (pitch / 4) + x] = pixel;
+                            }
+                        }
+
+                        SDL_UnlockTexture(renderer->texture);
+
                         int window_width, window_height;
                         SDL_GetWindowSize(renderer->window, &window_width, &window_height);
-
-                        SDL_UpdateTexture(renderer->texture, nullptr, seekframe_get_data(frame), frame_stride);
 
                         SDL_Rect thermal_rect;
                         thermal_rect.x = 0;
