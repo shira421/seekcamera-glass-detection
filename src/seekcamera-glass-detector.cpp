@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Thermal Object Tracker - Custom Color Mapping
  * Maps raw temperature data to custom colors with steep gradient
  */
@@ -32,7 +32,21 @@
 #include "seekcamera/seekcamera_manager.h"
 #include "seekframe/seekframe.h"
 
- // Thermal Object structure
+ // COLOR MODES - must be defined BEFORE structs
+enum ColorMode {
+    ABSOLUTE,    // Fixed temp range (20-70°C) - for distance sensing
+    RELATIVE     // Frame min/max - for debugging/visibility
+};
+
+// ABSOLUTE mode temperature range
+const float ABS_TEMP_MIN = 22.0f;
+const float ABS_TEMP_MAX = 30.0f;
+
+// DETECTION PARAMETERS
+const int MIN_OBJECT_SIZE = 15;
+const int SIDEBAR_WIDTH = 300;
+
+// Thermal Object structure
 struct ThermalObject {
     int id;
     int x, y, width, height;
@@ -59,6 +73,7 @@ struct seekrenderer_t {
     int next_object_id;
     float center_pixel_temp;
     float user_temp_threshold;
+    ColorMode color_mode;  // Toggle between ABSOLUTE and RELATIVE
 
     int mouse_x, mouse_y;
     bool mouse_down;
@@ -67,6 +82,7 @@ struct seekrenderer_t {
         texture(nullptr), font(nullptr), font_small(nullptr),
         frame(nullptr), next_object_id(1),
         center_pixel_temp(0.0f), user_temp_threshold(35.0f),
+        color_mode(ABSOLUTE),  // Default to ABSOLUTE for production
         mouse_x(0), mouse_y(0), mouse_down(false) {
         is_active.store(false);
         is_dirty.store(false);
@@ -79,13 +95,55 @@ static std::mutex g_mutex;
 static std::condition_variable g_condition_variable;
 static std::atomic<bool> g_is_dirty;
 
-// DETECTION PARAMETERS
-const int MIN_OBJECT_SIZE = 15;
-const int SIDEBAR_WIDTH = 300;
+// ABSOLUTE COLOR MAPPING - Fixed temp range (20-70°C)
+// Always maps same temperature to same color
+SDL_Color mapTemperatureAbsolute(float temp) {
+    SDL_Color color;
 
-// CUSTOM COLOR MAPPING - Ultra steep gradient relative to frame
-// This bypasses hardware palette completely!
-SDL_Color mapTemperatureToColor(float temp, float min_temp, float max_temp) {
+    // Clamp to absolute range
+    float normalized = (temp - ABS_TEMP_MIN) / (ABS_TEMP_MAX - ABS_TEMP_MIN);
+    normalized = std::max(0.0f, std::min(1.0f, normalized));
+
+    // Apply steep power curve for sensitivity
+    normalized = std::pow(normalized, 0.3f);  // Steep but not crazy
+
+    // Map to vibrant gradient: Blue → Cyan → Green → Yellow → Red
+    if (normalized < 0.25f) {
+        // Blue to Cyan
+        float t = normalized * 4.0f;
+        color.r = 0;
+        color.g = (Uint8)(t * 255);
+        color.b = 255;
+    }
+    else if (normalized < 0.5f) {
+        // Cyan to Green
+        float t = (normalized - 0.25f) * 4.0f;
+        color.r = 0;
+        color.g = 255;
+        color.b = (Uint8)((1.0f - t) * 255);
+    }
+    else if (normalized < 0.75f) {
+        // Green to Yellow
+        float t = (normalized - 0.5f) * 4.0f;
+        color.r = (Uint8)(t * 255);
+        color.g = 255;
+        color.b = 0;
+    }
+    else {
+        // Yellow to Red
+        float t = (normalized - 0.75f) * 4.0f;
+        color.r = 255;
+        color.g = (Uint8)((1.0f - t) * 255);
+        color.b = 0;
+    }
+
+    color.a = 255;
+    return color;
+}
+
+// RELATIVE COLOR MAPPING - Frame min/max (ultra steep for debugging)
+// Maps relative to current frame for maximum visibility
+SDL_Color mapTemperatureRelative(float temp, float min_temp, float max_temp) {
     SDL_Color color;
 
     float range = max_temp - min_temp;
@@ -98,10 +156,10 @@ SDL_Color mapTemperatureToColor(float temp, float min_temp, float max_temp) {
     // Normalize temperature relative to THIS frame
     float normalized = (temp - min_temp) / range;
 
-    // Apply STEEP power curve
-    normalized = std::pow(normalized, 0.15f);  // Very steep!
+    // Apply ULTRA STEEP power curve
+    normalized = std::pow(normalized, 0.15f);  // Very steep for debugging!
 
-    // Map to vibrant gradient: Blue -> Cyan -> Green -> Yellow -> Red
+    // Map to vibrant gradient: Blue → Cyan → Green → Yellow → Red
     if (normalized < 0.25f) {
         // Blue to Cyan
         float t = normalized * 4.0f;
@@ -381,7 +439,8 @@ void renderTextLine(SDL_Renderer* renderer, TTF_Font* font, const char* text, in
 void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_small,
     const std::vector<ThermalObject>& objects, float center_temp,
     int center_x_thermal, int center_y_thermal, float& user_threshold,
-    int window_width, int window_height, int mouse_x, int mouse_y, bool mouse_down) {
+    ColorMode color_mode, int window_width, int window_height,
+    int mouse_x, int mouse_y, bool mouse_down) {
 
     int sidebar_x = window_width - SIDEBAR_WIDTH;
 
@@ -526,6 +585,29 @@ void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_small,
 
     snprintf(summary, sizeof(summary), "Active Threshold: %.1f C", user_threshold);
     renderTextLine(renderer, font_small, summary, sidebar_x + 10, y_pos, white);
+    y_pos += 25;
+
+    // Color Mode Display
+    SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
+    SDL_RenderDrawLine(renderer, sidebar_x + 10, y_pos, sidebar_x + SIDEBAR_WIDTH - 10, y_pos);
+    y_pos += 12;
+
+    renderTextLine(renderer, font, "Color Mode", sidebar_x + 10, y_pos, white);
+    y_pos += 25;
+
+    const char* mode_text = (color_mode == ABSOLUTE) ? "ABSOLUTE (22-30 C)" : "RELATIVE (Frame Min/Max)";
+    SDL_Color mode_color = (color_mode == ABSOLUTE) ?
+        SDL_Color{ 0, 255, 100, 255 } :  // Green for ABSOLUTE
+        SDL_Color{ 255, 200, 0, 255 };    // Yellow for RELATIVE
+    renderTextLine(renderer, font_small, mode_text, sidebar_x + 10, y_pos, mode_color);
+    y_pos += 18;
+
+    const char* usage_text = (color_mode == ABSOLUTE) ?
+        "For: Distance sensing" : "For: Max visibility";
+    renderTextLine(renderer, font_small, usage_text, sidebar_x + 10, y_pos, white);
+    y_pos += 18;
+
+    renderTextLine(renderer, font_small, "Press 'M' to toggle", sidebar_x + 10, y_pos, SDL_Color{ 150, 150, 150, 255 });
 }
 
 void handle_camera_frame_available(seekcamera_t* camera, seekcamera_frame_t* camera_frame, void* user_data) {
@@ -709,16 +791,19 @@ int main() {
     signal(SIGINT, signal_callback);
     signal(SIGTERM, signal_callback);
 
-    std::cout << "Thermal Object Tracker - Custom Color Mapping" << std::endl;
+    std::cout << "Thermal Object Tracker - Hybrid Color Mapping" << std::endl;
     std::cout << "==============================================" << std::endl;
     std::cout << "Features:" << std::endl;
-    std::cout << "- CUSTOM color mapping bypasses hardware palette!" << std::endl;
-    std::cout << "- Ultra-steep gradient relative to frame temps" << std::endl;
+    std::cout << "- HYBRID system: Toggle between ABSOLUTE and RELATIVE" << std::endl;
+    std::cout << "- ABSOLUTE mode: 22-30 C fixed (optimized for low-temp sources)" << std::endl;
+    std::cout << "- RELATIVE mode: Frame min/max (for debugging)" << std::endl;
+    std::cout << "- Custom color mapping bypasses hardware palette!" << std::endl;
     std::cout << "- Blue (cool) -> Cyan -> Green -> Yellow -> Red (hot)" << std::endl;
-    std::cout << "- Hot spots will POP even on uniform glass" << std::endl;
-    std::cout << "- Power curve 0.15 for extreme steepness" << std::endl;
+    std::cout << "\nControls:" << std::endl;
+    std::cout << "- Press 'M' to toggle between ABSOLUTE/RELATIVE modes" << std::endl;
+    std::cout << "- Press 'Q' to quit" << std::endl;
     std::cout << "- Drag slider (20-100 C) to set detection threshold" << std::endl;
-    std::cout << "\nPress 'q' to quit\n" << std::endl;
+    std::cout << "\nStarting in ABSOLUTE mode (22-30 C optimized for your heat source)\n" << std::endl;
 
     SDL_Init(SDL_INIT_VIDEO);
     TTF_Init();
@@ -816,7 +901,7 @@ int main() {
                             max_temp = std::max(max_temp, temps[i]);
                         }
 
-                        // Create custom colored image
+                        // Create custom colored image based on mode
                         Uint32* pixels;
                         int pitch;
                         SDL_LockTexture(renderer->texture, nullptr, (void**)&pixels, &pitch);
@@ -824,7 +909,16 @@ int main() {
                         for (int y = 0; y < frame_height; y++) {
                             for (int x = 0; x < frame_width; x++) {
                                 float temp = temps[y * frame_width + x];
-                                SDL_Color color = mapTemperatureToColor(temp, min_temp, max_temp);
+
+                                SDL_Color color;
+                                if (renderer->color_mode == ABSOLUTE) {
+                                    // ABSOLUTE: Fixed 20-70°C range
+                                    color = mapTemperatureAbsolute(temp);
+                                }
+                                else {
+                                    // RELATIVE: Frame min/max for maximum visibility
+                                    color = mapTemperatureRelative(temp, min_temp, max_temp);
+                                }
 
                                 // Convert to ARGB8888
                                 Uint32 pixel = (255 << 24) | (color.r << 16) | (color.g << 8) | color.b;
@@ -861,8 +955,8 @@ int main() {
                         drawSidebar(renderer->renderer, renderer->font, renderer->font_small,
                             renderer->detected_objects, renderer->center_pixel_temp,
                             center_x_thermal, center_y_thermal, renderer->user_temp_threshold,
-                            window_width, window_height, renderer->mouse_x, renderer->mouse_y,
-                            renderer->mouse_down);
+                            renderer->color_mode, window_width, window_height,
+                            renderer->mouse_x, renderer->mouse_y, renderer->mouse_down);
 
                         SDL_RenderPresent(renderer->renderer);
 
@@ -884,6 +978,19 @@ int main() {
             }
             else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_q) {
                 g_exit_requested.store(true);
+            }
+            else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_m) {
+                // Toggle color mode with 'M' key
+                for (std::map<std::string, seekrenderer_t*>::iterator it = g_renderers.begin();
+                    it != g_renderers.end(); ++it) {
+                    if (it->second != nullptr) {
+                        it->second->color_mode = (it->second->color_mode == ABSOLUTE) ?
+                            RELATIVE : ABSOLUTE;
+                        std::cout << "Color mode: " <<
+                            ((it->second->color_mode == ABSOLUTE) ? "ABSOLUTE" : "RELATIVE")
+                            << std::endl;
+                    }
+                }
             }
             else if (event.type == SDL_MOUSEMOTION) {
                 for (std::map<std::string, seekrenderer_t*>::iterator it = g_renderers.begin();
