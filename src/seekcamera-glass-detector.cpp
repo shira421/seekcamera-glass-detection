@@ -32,15 +32,15 @@
 #include "seekcamera/seekcamera_manager.h"
 #include "seekframe/seekframe.h"
 
- // COLOR MODES - must be defined BEFORE structs
+// COLOR MODES - must be defined BEFORE structs
 enum ColorMode {
     ABSOLUTE,    // Fixed temp range (20-70°C) - for distance sensing
     RELATIVE     // Frame min/max - for debugging/visibility
 };
 
 // ABSOLUTE mode temperature range
-const float ABS_TEMP_MIN = 22.0f;
-const float ABS_TEMP_MAX = 30.0f;
+const float ABS_TEMP_MIN = 24.0f;
+const float ABS_TEMP_MAX = 28.0f;
 
 // DETECTION PARAMETERS
 const int MIN_OBJECT_SIZE = 15;
@@ -72,8 +72,9 @@ struct seekrenderer_t {
     std::vector<ThermalObject> detected_objects;
     int next_object_id;
     float center_pixel_temp;
-    float user_temp_threshold;
     ColorMode color_mode;  // Toggle between ABSOLUTE and RELATIVE
+    bool signature_isolation;  // Toggle signature isolation mode
+    float isolation_percentile;  // Top X% to show (0.05 = 5%, 0.10 = 10%)
 
     int mouse_x, mouse_y;
     bool mouse_down;
@@ -81,8 +82,10 @@ struct seekrenderer_t {
     seekrenderer_t() : camera(nullptr), window(nullptr), renderer(nullptr),
         texture(nullptr), font(nullptr), font_small(nullptr),
         frame(nullptr), next_object_id(1),
-        center_pixel_temp(0.0f), user_temp_threshold(35.0f),
-        color_mode(ABSOLUTE),  // Default to ABSOLUTE for production
+        center_pixel_temp(0.0f),
+        color_mode(RELATIVE),  // Default to RELATIVE for red pixel detection
+        signature_isolation(true),  // Start with isolation ON
+        isolation_percentile(0.10f),  // Default: show top 10%
         mouse_x(0), mouse_y(0), mouse_down(false) {
         is_active.store(false);
         is_dirty.store(false);
@@ -95,18 +98,18 @@ static std::mutex g_mutex;
 static std::condition_variable g_condition_variable;
 static std::atomic<bool> g_is_dirty;
 
-// ABSOLUTE COLOR MAPPING - Fixed temp range (20-70°C)
+// ABSOLUTE COLOR MAPPING - Fixed temp range (24-28°C)
 // Always maps same temperature to same color
 SDL_Color mapTemperatureAbsolute(float temp) {
     SDL_Color color;
-
+    
     // Clamp to absolute range
     float normalized = (temp - ABS_TEMP_MIN) / (ABS_TEMP_MAX - ABS_TEMP_MIN);
     normalized = std::max(0.0f, std::min(1.0f, normalized));
-
+    
     // Apply steep power curve for sensitivity
     normalized = std::pow(normalized, 0.3f);  // Steep but not crazy
-
+    
     // Map to vibrant gradient: Blue → Cyan → Green → Yellow → Red
     if (normalized < 0.25f) {
         // Blue to Cyan
@@ -114,51 +117,89 @@ SDL_Color mapTemperatureAbsolute(float temp) {
         color.r = 0;
         color.g = (Uint8)(t * 255);
         color.b = 255;
-    }
-    else if (normalized < 0.5f) {
+    } else if (normalized < 0.5f) {
         // Cyan to Green
         float t = (normalized - 0.25f) * 4.0f;
         color.r = 0;
         color.g = 255;
         color.b = (Uint8)((1.0f - t) * 255);
-    }
-    else if (normalized < 0.75f) {
+    } else if (normalized < 0.75f) {
         // Green to Yellow
         float t = (normalized - 0.5f) * 4.0f;
         color.r = (Uint8)(t * 255);
         color.g = 255;
         color.b = 0;
-    }
-    else {
+    } else {
         // Yellow to Red
         float t = (normalized - 0.75f) * 4.0f;
         color.r = 255;
         color.g = (Uint8)((1.0f - t) * 255);
         color.b = 0;
     }
-
+    
     color.a = 255;
     return color;
 }
 
 // RELATIVE COLOR MAPPING - Frame min/max (ultra steep for debugging)
 // Maps relative to current frame for maximum visibility
-SDL_Color mapTemperatureRelative(float temp, float min_temp, float max_temp) {
+// WITH TOP-PERCENTILE FILTERING for signature isolation
+SDL_Color mapTemperatureRelative(float temp, float min_temp, float max_temp, bool isolate_signature = false, float top_percentile = 0.10f) {
     SDL_Color color;
-
+    
     float range = max_temp - min_temp;
     if (range < 0.01f) {
         // Uniform temperature - show as dark
         color.r = 20; color.g = 20; color.b = 20; color.a = 255;
         return color;
     }
-
-    // Normalize temperature relative to THIS frame
+    
+    // SIGNATURE ISOLATION MODE
+    if (isolate_signature) {
+        // Only show top X% of temperature range
+        float threshold = max_temp - (range * top_percentile);
+        
+        if (temp < threshold) {
+            // Below threshold - BLACK IT OUT
+            color.r = 0; color.g = 0; color.b = 0; color.a = 255;
+            return color;
+        }
+        
+        // Above threshold - map within the top percentile range
+        float normalized = (temp - threshold) / (range * top_percentile);
+        normalized = std::pow(normalized, 0.15f);  // Ultra steep!
+        
+        // Map to vibrant gradient: Blue → Cyan → Green → Yellow → Red
+        if (normalized < 0.25f) {
+            float t = normalized * 4.0f;
+            color.r = 0;
+            color.g = (Uint8)(t * 255);
+            color.b = 255;
+        } else if (normalized < 0.5f) {
+            float t = (normalized - 0.25f) * 4.0f;
+            color.r = 0;
+            color.g = 255;
+            color.b = (Uint8)((1.0f - t) * 255);
+        } else if (normalized < 0.75f) {
+            float t = (normalized - 0.5f) * 4.0f;
+            color.r = (Uint8)(t * 255);
+            color.g = 255;
+            color.b = 0;
+        } else {
+            float t = (normalized - 0.75f) * 4.0f;
+            color.r = 255;
+            color.g = (Uint8)((1.0f - t) * 255);
+            color.b = 0;
+        }
+        
+        color.a = 255;
+        return color;
+    }
+    
+    // NORMAL RELATIVE MODE (full range)
     float normalized = (temp - min_temp) / range;
-
-    // Apply ULTRA STEEP power curve
-    normalized = std::pow(normalized, 0.15f);  // Very steep for debugging!
-
+    normalized = std::pow(normalized, 0.15f);  // Very steep!
+    
     // Map to vibrant gradient: Blue → Cyan → Green → Yellow → Red
     if (normalized < 0.25f) {
         // Blue to Cyan
@@ -166,29 +207,26 @@ SDL_Color mapTemperatureRelative(float temp, float min_temp, float max_temp) {
         color.r = 0;
         color.g = (Uint8)(t * 255);
         color.b = 255;
-    }
-    else if (normalized < 0.5f) {
+    } else if (normalized < 0.5f) {
         // Cyan to Green
         float t = (normalized - 0.25f) * 4.0f;
         color.r = 0;
         color.g = 255;
         color.b = (Uint8)((1.0f - t) * 255);
-    }
-    else if (normalized < 0.75f) {
+    } else if (normalized < 0.75f) {
         // Green to Yellow
         float t = (normalized - 0.5f) * 4.0f;
         color.r = (Uint8)(t * 255);
         color.g = 255;
         color.b = 0;
-    }
-    else {
+    } else {
         // Yellow to Red
         float t = (normalized - 0.75f) * 4.0f;
         color.r = 255;
         color.g = (Uint8)((1.0f - t) * 255);
         color.b = 0;
     }
-
+    
     color.a = 255;
     return color;
 }
@@ -221,6 +259,232 @@ SDL_Color getTemperatureColor(float temp, float min_threshold, float max_range) 
     color.a = 255;
     return color;
 }
+
+// SIZE-BASED DISTANCE SENSOR - Now with SIGNATURE LOCKING
+class TriangulationDistanceSensor {
+private:
+    // SIZE-BASED CALIBRATION
+    const float CALIBRATION_DISTANCE = 0.03f;  // 3cm (known distance)
+    float calibration_area = 0.0f;
+    bool is_calibrated = false;
+    
+    // SIGNATURE LOCKING
+    bool signature_locked = false;
+    int locked_signature_id = -1;
+    
+    // Locked signature characteristics (for tracking across frames)
+    struct LockedSignature {
+        float center_x, center_y;  // Last known position
+        float temp_min, temp_max;  // Temperature range
+        float area_expected;       // Expected area (for validation)
+        int frames_lost;           // Counter for lost tracking
+    };
+    
+    LockedSignature locked_sig;
+    
+    // CAMERA SPECIFICATIONS
+    const float SENSOR_WIDTH = 320.0f;
+    const float SENSOR_HEIGHT = 240.0f;
+    const int MAX_FRAMES_LOST = 5;  // Allow 5 frames of lost tracking before unlock
+    
+public:
+    TriangulationDistanceSensor() {
+        locked_sig.center_x = 0;
+        locked_sig.center_y = 0;
+        locked_sig.temp_min = 0;
+        locked_sig.temp_max = 0;
+        locked_sig.area_expected = 0;
+        locked_sig.frames_lost = 0;
+        
+        std::cout << "\n=== Gradient Pattern-Based Distance Sensor ===" << std::endl;
+        std::cout << "Tracks signature by spatial temperature pattern" << std::endl;
+        std::cout << "Press 'U' to UNLOCK and redetect\n" << std::endl;
+    }
+    
+    // Lock onto a specific signature
+    void lockSignature(const ThermalObject& obj) {
+        signature_locked = true;
+        locked_signature_id = obj.id;
+        
+        // Store signature characteristics
+        locked_sig.center_x = obj.x + obj.width / 2.0f;
+        locked_sig.center_y = obj.y + obj.height / 2.0f;
+        locked_sig.temp_min = obj.min_temp;
+        locked_sig.temp_max = obj.max_temp;
+        locked_sig.area_expected = obj.width * obj.height;
+        locked_sig.frames_lost = 0;
+        
+        // Auto-calibrate on lock
+        if (!is_calibrated) {
+            calibration_area = locked_sig.area_expected;
+            is_calibrated = true;
+            std::cout << "✓ AUTO-LOCKED & CALIBRATED: Area = " << calibration_area 
+                      << " px² at " << (CALIBRATION_DISTANCE * 100) << " cm" << std::endl;
+        } else {
+            std::cout << "✓ AUTO-LOCKED onto signature" << std::endl;
+        }
+        
+        std::cout << "  Position: (" << locked_sig.center_x << ", " << locked_sig.center_y << ")" << std::endl;
+        std::cout << "  Temp: " << locked_sig.temp_min << "-" << locked_sig.temp_max << " °C" << std::endl;
+        std::cout << "  Area: " << locked_sig.area_expected << " px²" << std::endl;
+    }
+    
+    // Unlock signature
+    void unlockSignature() {
+        if (signature_locked) {
+            signature_locked = false;
+            locked_signature_id = -1;
+            std::cout << "✗ UNLOCKED signature" << std::endl;
+        }
+    }
+    
+    // Check if signature is locked
+    bool isLocked() const {
+        return signature_locked;
+    }
+    
+    // Find the locked signature in current frame
+    ThermalObject* findLockedSignature(std::vector<ThermalObject>& objects) {
+        if (!signature_locked) return nullptr;
+        
+        ThermalObject* best_match = nullptr;
+        float best_score = 999999.0f;
+        
+        for (size_t i = 0; i < objects.size(); i++) {
+            // Calculate match score based on:
+            // 1. Position proximity
+            // 2. Temperature similarity
+            // 3. Size similarity
+            
+            float obj_center_x = objects[i].x + objects[i].width / 2.0f;
+            float obj_center_y = objects[i].y + objects[i].height / 2.0f;
+            
+            // Position distance (normalized)
+            float pos_diff = sqrt(pow(obj_center_x - locked_sig.center_x, 2) + 
+                                 pow(obj_center_y - locked_sig.center_y, 2));
+            float pos_score = pos_diff / 50.0f;  // Normalize to ~50 pixel max movement
+            
+            // Temperature similarity
+            float temp_center = (locked_sig.temp_min + locked_sig.temp_max) / 2.0f;
+            float obj_temp_center = (objects[i].min_temp + objects[i].max_temp) / 2.0f;
+            float temp_diff = fabs(temp_center - obj_temp_center);
+            float temp_score = temp_diff / 2.0f;  // Normalize to 2°C tolerance
+            
+            // Size similarity
+            float obj_area = objects[i].width * objects[i].height;
+            float size_ratio = obj_area / locked_sig.area_expected;
+            if (size_ratio > 1.0f) size_ratio = 1.0f / size_ratio;  // Normalize
+            float size_score = 1.0f - size_ratio;
+            
+            // Combined score (lower is better)
+            float score = pos_score + temp_score + size_score;
+            
+            if (score < best_score && score < 3.0f) {  // Threshold for valid match
+                best_score = score;
+                best_match = &objects[i];
+            }
+        }
+        
+        if (best_match != nullptr) {
+            // Update locked signature position for next frame
+            locked_sig.center_x = best_match->x + best_match->width / 2.0f;
+            locked_sig.center_y = best_match->y + best_match->height / 2.0f;
+            locked_sig.area_expected = best_match->width * best_match->height;
+            locked_sig.frames_lost = 0;
+        } else {
+            // Lost tracking
+            locked_sig.frames_lost++;
+            if (locked_sig.frames_lost >= MAX_FRAMES_LOST) {
+                std::cout << "⚠ Lost tracking for " << MAX_FRAMES_LOST 
+                          << " frames - auto-unlocking" << std::endl;
+                unlockSignature();
+            }
+        }
+        
+        return best_match;
+    }
+    
+    // Calculate distance from pixel area
+    float calculateDistanceFromSize(float pixel_area) {
+        if (!is_calibrated) {
+            calibration_area = pixel_area;
+            is_calibrated = true;
+            return CALIBRATION_DISTANCE;
+        }
+        
+        float distance = CALIBRATION_DISTANCE * sqrt(calibration_area / pixel_area);
+        return distance;
+    }
+    
+    struct DistanceResult {
+        bool detected;
+        bool is_locked;
+        float distance_m;
+        float distance_cm;
+        float confidence;
+        
+        int pixel_x;
+        int pixel_y;
+        int pixel_width;
+        int pixel_height;
+        int pixel_area;
+        float avg_temp;
+    };
+    
+    DistanceResult measure(std::vector<ThermalObject>& objects, bool auto_lock = true) {
+        DistanceResult result;
+        result.detected = false;
+        result.is_locked = signature_locked;
+        
+        ThermalObject* signature = nullptr;
+        
+        if (signature_locked) {
+            // Use LOCKED signature only
+            signature = findLockedSignature(objects);
+            
+            if (signature == nullptr) {
+                // Still locked but not found this frame
+                return result;
+            }
+        } else {
+            // Find first object (should be the red dot after isolation)
+            if (!objects.empty()) {
+                signature = &objects[0];
+                
+                // AUTO-LOCK on first detection
+                if (auto_lock) {
+                    lockSignature(*signature);
+                }
+            }
+        }
+        
+        if (signature == nullptr) {
+            return result;
+        }
+        
+        // Calculate pixel area
+        int pixel_area = signature->width * signature->height;
+        
+        // Calculate distance from size
+        result.distance_m = calculateDistanceFromSize((float)pixel_area);
+        result.distance_cm = result.distance_m * 100.0f;
+        
+        // Confidence based on temperature
+        float temp_diff = fabs(signature->avg_temp - 27.5f);
+        result.confidence = std::max(0.0f, 1.0f - (temp_diff / 3.0f));
+        
+        // Debug info
+        result.pixel_x = signature->x + signature->width / 2;
+        result.pixel_y = signature->y + signature->height / 2;
+        result.pixel_width = signature->width;
+        result.pixel_height = signature->height;
+        result.pixel_area = pixel_area;
+        result.avg_temp = signature->avg_temp;
+        result.detected = true;
+        
+        return result;
+    }
+};
 
 // Connected component labeling
 std::vector<std::vector<int> > findConnectedComponents(std::vector<std::vector<bool> >& binary_map, int width, int height) {
@@ -262,24 +526,156 @@ std::vector<std::vector<int> > findConnectedComponents(std::vector<std::vector<b
     return labels;
 }
 
-// Detect hot objects
-std::vector<ThermalObject> detectHotObjects(float* temps, int width, int height, int& next_id, float threshold) {
-    std::vector<ThermalObject> objects;
+// GRADIENT-BASED HEAT SIGNATURE ANALYSIS
+// Analyzes the spatial temperature pattern to identify the specific signature
+struct SignatureScore {
+    float gradient_quality;    // How smoothly temperature declines from center
+    float compactness;         // How concentrated the signature is
+    float peak_centrality;     // How centered the hottest point is
+    float overall_score;       // Combined score
+};
 
-    std::vector<std::vector<bool> > hot_pixels(height, std::vector<bool>(width, false));
-
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            if (temps[y * width + x] >= threshold) {
-                hot_pixels[y][x] = true;
+SignatureScore analyzeSignaturePattern(float* temps, int width, int height, const ThermalObject& obj) {
+    SignatureScore score;
+    score.gradient_quality = 0.0f;
+    score.compactness = 0.0f;
+    score.peak_centrality = 0.0f;
+    score.overall_score = 0.0f;
+    
+    // Find peak temperature location within object
+    int peak_x = obj.x;
+    int peak_y = obj.y;
+    float peak_temp = -1000.0f;
+    
+    for (int y = obj.y; y < obj.y + obj.height && y < height; y++) {
+        for (int x = obj.x; x < obj.x + obj.width && x < width; x++) {
+            float temp = temps[y * width + x];
+            if (temp > peak_temp) {
+                peak_temp = temp;
+                peak_x = x;
+                peak_y = y;
             }
         }
     }
+    
+    // 1. PEAK CENTRALITY: Peak should be near center of bounding box
+    float center_x = obj.x + obj.width / 2.0f;
+    float center_y = obj.y + obj.height / 2.0f;
+    float peak_offset = sqrt(pow(peak_x - center_x, 2) + pow(peak_y - center_y, 2));
+    float max_offset = sqrt(pow(obj.width / 2.0f, 2) + pow(obj.height / 2.0f, 2));
+    score.peak_centrality = max_offset > 0 ? (1.0f - (peak_offset / max_offset)) : 1.0f;
+    
+    // 2. GRADIENT QUALITY: Temperature should decline smoothly from peak
+    // Sample in 4 directions from peak and measure gradient
+    float gradient_scores[4] = {0, 0, 0, 0};
+    int directions[4][2] = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};  // Right, Down, Left, Up
+    
+    for (int dir = 0; dir < 4; dir++) {
+        int dx = directions[dir][0];
+        int dy = directions[dir][1];
+        
+        float last_temp = peak_temp;
+        int consecutive_declines = 0;
+        int total_samples = 0;
+        
+        // Sample up to 5 pixels in this direction
+        for (int step = 1; step <= 5; step++) {
+            int sample_x = peak_x + (dx * step);
+            int sample_y = peak_y + (dy * step);
+            
+            // Check bounds
+            if (sample_x < 0 || sample_x >= width || sample_y < 0 || sample_y >= height) break;
+            if (sample_x < obj.x || sample_x >= obj.x + obj.width) break;
+            if (sample_y < obj.y || sample_y >= obj.y + obj.height) break;
+            
+            float sample_temp = temps[sample_y * width + sample_x];
+            
+            // Check if temperature declined
+            if (sample_temp < last_temp) {
+                consecutive_declines++;
+            }
+            last_temp = sample_temp;
+            total_samples++;
+        }
+        
+        // Score this direction based on consistent decline
+        gradient_scores[dir] = total_samples > 0 ? (float)consecutive_declines / total_samples : 0.0f;
+    }
+    
+    // Average gradient quality across all directions
+    score.gradient_quality = (gradient_scores[0] + gradient_scores[1] + 
+                              gradient_scores[2] + gradient_scores[3]) / 4.0f;
+    
+    // 3. COMPACTNESS: Signature should be small and concentrated
+    // Score based on size (smaller is better for the dot signature)
+    int area = obj.width * obj.height;
+    float ideal_min_area = 9.0f;    // ~3x3 pixels minimum
+    float ideal_max_area = 400.0f;  // ~20x20 pixels maximum
+    
+    if (area < ideal_min_area) {
+        score.compactness = 0.0f;  // Too small to be reliable
+    } else if (area > ideal_max_area) {
+        score.compactness = 0.3f;  // Too large, probably not our signature
+    } else {
+        // Prefer medium-sized signatures
+        float size_ratio = (float)area / ideal_max_area;
+        score.compactness = 1.0f - (size_ratio * 0.5f);  // Peaks at small sizes
+    }
+    
+    // 4. OVERALL SCORE: Weighted combination
+    // Gradient quality is most important (signature characteristic)
+    // Peak centrality ensures it's a focused blob
+    // Compactness ensures appropriate size
+    score.overall_score = (score.gradient_quality * 0.5f) +   // 50% weight
+                          (score.peak_centrality * 0.3f) +     // 30% weight
+                          (score.compactness * 0.2f);          // 20% weight
+    
+    return score;
+}
 
-    std::vector<std::vector<int> > labels = findConnectedComponents(hot_pixels, width, height);
-
+// AUTOMATIC RED-PIXEL DETECTION WITH GRADIENT PATTERN MATCHING
+// Detects objects that would appear RED (top percentile) and match signature pattern
+std::vector<ThermalObject> detectRedPixels(float* temps, int width, int height, int& next_id, 
+                                            bool use_isolation, float isolation_percentile) {
+    std::vector<ThermalObject> objects;
+    
+    // Find min/max temps
+    float min_temp = 1000.0f;
+    float max_temp = -1000.0f;
+    for (int i = 0; i < width * height; i++) {
+        min_temp = std::min(min_temp, temps[i]);
+        max_temp = std::max(max_temp, temps[i]);
+    }
+    
+    float range = max_temp - min_temp;
+    if (range < 0.01f) return objects;  // No variation
+    
+    // Calculate threshold - only pixels that would be RED
+    float threshold;
+    if (use_isolation) {
+        // Top X% (the red pixels after isolation)
+        threshold = max_temp - (range * isolation_percentile);
+    } else {
+        // Top 5% by default
+        threshold = max_temp - (range * 0.05f);
+    }
+    
+    // Create binary map of "red" pixels
+    std::vector<std::vector<bool> > red_pixels(height, std::vector<bool>(width, false));
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            if (temps[y * width + x] >= threshold) {
+                red_pixels[y][x] = true;
+            }
+        }
+    }
+    
+    // Find connected components of red pixels
+    std::vector<std::vector<int> > labels = findConnectedComponents(red_pixels, width, height);
+    
+    // Extract objects from labeled components
     std::map<int, ThermalObject> object_map;
-
+    
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int label = labels[y][x];
@@ -296,28 +692,28 @@ std::vector<ThermalObject> detectHotObjects(float* temps, int width, int height,
                     obj.avg_temp = 0.0f;
                     object_map[label] = obj;
                 }
-
+                
                 ThermalObject& obj = object_map[label];
                 obj.x = std::min(obj.x, x);
                 obj.y = std::min(obj.y, y);
                 obj.width = std::max(obj.width, x - obj.x + 1);
                 obj.height = std::max(obj.height, y - obj.y + 1);
-
+                
                 float temp = temps[y * width + x];
                 obj.min_temp = std::min(obj.min_temp, temp);
                 obj.max_temp = std::max(obj.max_temp, temp);
             }
         }
     }
-
+    
+    // Calculate averages and analyze patterns
+    std::vector<std::pair<ThermalObject, SignatureScore> > scored_objects;
+    
     for (std::map<int, ThermalObject>::iterator it = object_map.begin();
         it != object_map.end(); ++it) {
         ThermalObject& obj = it->second;
-
-        if (obj.width < MIN_OBJECT_SIZE || obj.height < MIN_OBJECT_SIZE) {
-            continue;
-        }
-
+        
+        // Calculate average temperature
         float sum = 0.0f;
         int count = 0;
         for (int y = obj.y; y < obj.y + obj.height && y < height; y++) {
@@ -329,12 +725,54 @@ std::vector<ThermalObject> detectHotObjects(float* temps, int width, int height,
             }
         }
         obj.avg_temp = count > 0 ? sum / count : obj.max_temp;
-
-        obj.box_color = getTemperatureColor(obj.avg_temp, threshold, 80.0f);
-
+        
+        // ANALYZE GRADIENT PATTERN
+        SignatureScore sig_score = analyzeSignaturePattern(temps, width, height, obj);
+        
+        // Only keep objects with good signature pattern (score > 0.4)
+        if (sig_score.overall_score > 0.4f) {
+            scored_objects.push_back(std::make_pair(obj, sig_score));
+        }
+    }
+    
+    // Sort by signature score (best match first)
+    for (size_t i = 0; i < scored_objects.size(); i++) {
+        for (size_t j = i + 1; j < scored_objects.size(); j++) {
+            if (scored_objects[j].second.overall_score > scored_objects[i].second.overall_score) {
+                std::swap(scored_objects[i], scored_objects[j]);
+            }
+        }
+    }
+    
+    // Return only the best matching signature(s)
+    // Typically just the top 1-2 best matches
+    int max_objects = 2;  // Return at most 2 best matches
+    for (size_t i = 0; i < scored_objects.size() && i < (size_t)max_objects; i++) {
+        ThermalObject obj = scored_objects[i].first;
+        SignatureScore score = scored_objects[i].second;
+        
+        // Color based on signature quality
+        if (score.overall_score > 0.7f) {
+            // Excellent match - bright green
+            obj.box_color.r = 0;
+            obj.box_color.g = 255;
+            obj.box_color.b = 0;
+        } else if (score.overall_score > 0.55f) {
+            // Good match - yellow
+            obj.box_color.r = 255;
+            obj.box_color.g = 255;
+            obj.box_color.b = 0;
+        } else {
+            // Weak match - orange/red
+            obj.box_color.r = 255;
+            obj.box_color.g = 100;
+            obj.box_color.b = 0;
+        }
+        obj.box_color.a = 255;
+        
         objects.push_back(obj);
     }
-
+    
     return objects;
 }
 
@@ -396,17 +834,13 @@ void drawThermalObject(SDL_Renderer* renderer, TTF_Font* font, const ThermalObje
 }
 
 // Draw center crosshair
-void drawCenterCrosshair(SDL_Renderer* renderer, TTF_Font* font, int width, int height, float temp, float threshold) {
+void drawCenterCrosshair(SDL_Renderer* renderer, TTF_Font* font, int width, int height, float temp) {
     int center_x = width / 2;
     int center_y = height / 2;
     int crosshair_size = 6;
 
-    if (temp >= threshold) {
-        SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
-    }
-    else {
-        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    }
+    // Always draw white crosshair (no threshold comparison needed)
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
 
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
 
@@ -438,8 +872,10 @@ void renderTextLine(SDL_Renderer* renderer, TTF_Font* font, const char* text, in
 // Draw sidebar
 void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_small,
     const std::vector<ThermalObject>& objects, float center_temp,
-    int center_x_thermal, int center_y_thermal, float& user_threshold,
-    ColorMode color_mode, int window_width, int window_height,
+    int center_x_thermal, int center_y_thermal,
+    ColorMode color_mode, bool& signature_isolation, float& isolation_percentile,
+    bool distance_detected, bool signature_locked, float distance_m, float distance_cm,
+    int window_width, int window_height, 
     int mouse_x, int mouse_y, bool mouse_down) {
 
     int sidebar_x = window_width - SIDEBAR_WIDTH;
@@ -451,67 +887,26 @@ void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_small,
 
     SDL_Color white = { 255, 255, 255, 255 };
     SDL_Color black = { 0, 0, 0, 255 };
-    int y_pos = 15;
+    int y_pos = 10;
 
-    // Temperature Threshold Control
-    renderTextLine(renderer, font, "Temperature Threshold", sidebar_x + 10, y_pos, white);
-    y_pos += 25;
-
-    int slider_x = sidebar_x + 10;
-    int slider_y = y_pos;
-    int slider_width = 280;
-    int slider_height = 20;
-
-    SDL_SetRenderDrawColor(renderer, 60, 60, 60, 255);
-    SDL_Rect slider_bg = { slider_x, slider_y, slider_width, slider_height };
-    SDL_RenderFillRect(renderer, &slider_bg);
-
-    float normalized = (user_threshold - 20.0f) / 80.0f;
-    int fill_width = (int)(slider_width * normalized);
-    SDL_SetRenderDrawColor(renderer, 0, 200, 0, 255);
-    SDL_Rect slider_fill = { slider_x, slider_y, fill_width, slider_height };
-    SDL_RenderFillRect(renderer, &slider_fill);
-
-    int handle_x = slider_x + fill_width - 5;
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    SDL_Rect slider_handle = { handle_x, slider_y - 2, 10, slider_height + 4 };
-    SDL_RenderFillRect(renderer, &slider_handle);
-
-    if (mouse_down && mouse_y >= slider_y && mouse_y <= slider_y + slider_height &&
-        mouse_x >= slider_x && mouse_x <= slider_x + slider_width) {
-        float new_normalized = (float)(mouse_x - slider_x) / slider_width;
-        new_normalized = std::max(0.0f, std::min(1.0f, new_normalized));
-        user_threshold = 20.0f + (new_normalized * 80.0f);
-    }
-
-    y_pos += 25;
-    char threshold_text[50];
-    snprintf(threshold_text, sizeof(threshold_text), "%.1f C (20-100 C range)", user_threshold);
-    renderTextLine(renderer, font_small, threshold_text, sidebar_x + 10, y_pos, white);
-    y_pos += 25;
-
-    // Center Pixel Info
-    SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
-    SDL_RenderDrawLine(renderer, sidebar_x + 10, y_pos, sidebar_x + SIDEBAR_WIDTH - 10, y_pos);
-    y_pos += 12;
-
+    // Center Pixel Info (COMPACT)
     renderTextLine(renderer, font, "Center Pixel", sidebar_x + 10, y_pos, white);
-    y_pos += 25;
+    y_pos += 20;
 
-    SDL_Color temp_color = getTemperatureColor(center_temp, user_threshold, 80.0f);
+    SDL_Color temp_color = {255, 200, 0, 255};  // Yellow/orange
     SDL_SetRenderDrawColor(renderer, temp_color.r, temp_color.g, temp_color.b, 255);
-    SDL_Rect temp_bar = { sidebar_x + 10, y_pos, 280, 30 };
+    SDL_Rect temp_bar = { sidebar_x + 10, y_pos, 280, 25 };
     SDL_RenderFillRect(renderer, &temp_bar);
 
     char temp_text[50];
     snprintf(temp_text, sizeof(temp_text), "%.1f C", center_temp);
-    renderTextLine(renderer, font, temp_text, sidebar_x + 20, y_pos + 5, black);
-    y_pos += 38;
+    renderTextLine(renderer, font, temp_text, sidebar_x + 20, y_pos + 4, black);
+    y_pos += 28;
 
     char pos_text[100];
-    snprintf(pos_text, sizeof(pos_text), "Pos: (%d, %d)", center_x_thermal, center_y_thermal);
+    snprintf(pos_text, sizeof(pos_text), "(%d, %d)", center_x_thermal, center_y_thermal);
     renderTextLine(renderer, font_small, pos_text, sidebar_x + 10, y_pos, white);
-    y_pos += 18;
+    y_pos += 25;
 
     // Find targeted object
     const ThermalObject* targeted_object = NULL;
@@ -524,90 +919,196 @@ void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_small,
         }
     }
 
-    const char* status_text;
-    if (targeted_object != NULL) {
-        status_text = "Status: Inside Object";
-    }
-    else if (center_temp >= user_threshold) {
-        status_text = "Status: Above Threshold";
-    }
-    else {
-        status_text = "Status: Below Threshold";
-    }
-    renderTextLine(renderer, font_small, status_text, sidebar_x + 10, y_pos, white);
-    y_pos += 25;
-
-    // Targeted Object
+    // Targeted Object (COMPACT)
     if (targeted_object != NULL) {
         SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
         SDL_RenderDrawLine(renderer, sidebar_x + 10, y_pos, sidebar_x + SIDEBAR_WIDTH - 10, y_pos);
-        y_pos += 12;
+        y_pos += 8;
 
-        renderTextLine(renderer, font, "Targeted Object", sidebar_x + 10, y_pos, white);
-        y_pos += 25;
+        renderTextLine(renderer, font, "Detected Signature", sidebar_x + 10, y_pos, white);
+        y_pos += 20;
 
         SDL_SetRenderDrawColor(renderer, targeted_object->box_color.r,
             targeted_object->box_color.g,
             targeted_object->box_color.b, 255);
-        SDL_Rect colorRect = { sidebar_x + 10, y_pos, 8, 60 };
+        SDL_Rect colorRect = { sidebar_x + 10, y_pos, 8, 45 };
         SDL_RenderFillRect(renderer, &colorRect);
 
         int text_x = sidebar_x + 22;
         char line[100];
 
-        snprintf(line, sizeof(line), "Avg: %.1f C", targeted_object->avg_temp);
+        snprintf(line, sizeof(line), "%.1f C", targeted_object->avg_temp);
         renderTextLine(renderer, font_small, line, text_x, y_pos, white);
-        y_pos += 18;
+        y_pos += 15;
 
-        snprintf(line, sizeof(line), "Min: %.1f C Max: %.1f C", targeted_object->min_temp, targeted_object->max_temp);
+        snprintf(line, sizeof(line), "Min: %.1f Max: %.1f", targeted_object->min_temp, targeted_object->max_temp);
         renderTextLine(renderer, font_small, line, text_x, y_pos, white);
-        y_pos += 18;
+        y_pos += 15;
 
-        snprintf(line, sizeof(line), "Size: %dx%d px (%d px)",
+        snprintf(line, sizeof(line), "%dx%d (%d px)", 
             targeted_object->width, targeted_object->height,
             targeted_object->width * targeted_object->height);
         renderTextLine(renderer, font_small, line, text_x, y_pos, white);
-        y_pos += 25;
+        y_pos += 15;
+        
+        // Show signature quality based on box color
+        const char* quality_text;
+        if (targeted_object->box_color.g == 255 && targeted_object->box_color.r == 0) {
+            quality_text = "Quality: Excellent";
+        } else if (targeted_object->box_color.g == 255 && targeted_object->box_color.r == 255) {
+            quality_text = "Quality: Good";
+        } else {
+            quality_text = "Quality: Weak";
+        }
+        renderTextLine(renderer, font_small, quality_text, text_x, y_pos, 
+            SDL_Color{targeted_object->box_color.r, targeted_object->box_color.g, targeted_object->box_color.b, 255});
+        y_pos += 20;
     }
 
-    // Detection Summary
+    // Detection Summary (COMPACT)
     SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
     SDL_RenderDrawLine(renderer, sidebar_x + 10, y_pos, sidebar_x + SIDEBAR_WIDTH - 10, y_pos);
-    y_pos += 12;
+    y_pos += 8;  // Reduced from 12
 
-    renderTextLine(renderer, font, "Detection Summary", sidebar_x + 10, y_pos, white);
-    y_pos += 25;
+    renderTextLine(renderer, font, "Detection", sidebar_x + 10, y_pos, white);
+    y_pos += 20;  // Reduced from 25
 
     char summary[100];
-    snprintf(summary, sizeof(summary), "Detected Objects: %zu", objects.size());
+    snprintf(summary, sizeof(summary), "Red Pixel Objects: %zu", objects.size());
     renderTextLine(renderer, font_small, summary, sidebar_x + 10, y_pos, white);
-    y_pos += 18;
-
-    snprintf(summary, sizeof(summary), "Active Threshold: %.1f C", user_threshold);
-    renderTextLine(renderer, font_small, summary, sidebar_x + 10, y_pos, white);
-    y_pos += 25;
-
-    // Color Mode Display
+    y_pos += 20;
+    
+    // Color Mode (COMPACT)
     SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
     SDL_RenderDrawLine(renderer, sidebar_x + 10, y_pos, sidebar_x + SIDEBAR_WIDTH - 10, y_pos);
-    y_pos += 12;
-
-    renderTextLine(renderer, font, "Color Mode", sidebar_x + 10, y_pos, white);
-    y_pos += 25;
-
-    const char* mode_text = (color_mode == ABSOLUTE) ? "ABSOLUTE (22-30 C)" : "RELATIVE (Frame Min/Max)";
-    SDL_Color mode_color = (color_mode == ABSOLUTE) ?
-        SDL_Color{ 0, 255, 100, 255 } :  // Green for ABSOLUTE
-        SDL_Color{ 255, 200, 0, 255 };    // Yellow for RELATIVE
+    y_pos += 8;  // Reduced from 12
+    
+    const char* mode_text = (color_mode == ABSOLUTE) ? "ABSOLUTE (24-28 C)" : "RELATIVE";
+    SDL_Color mode_color = (color_mode == ABSOLUTE) ? 
+        SDL_Color{0, 255, 100, 255} :  // Green for ABSOLUTE
+        SDL_Color{255, 200, 0, 255};    // Yellow for RELATIVE
     renderTextLine(renderer, font_small, mode_text, sidebar_x + 10, y_pos, mode_color);
-    y_pos += 18;
-
-    const char* usage_text = (color_mode == ABSOLUTE) ?
-        "For: Distance sensing" : "For: Max visibility";
-    renderTextLine(renderer, font_small, usage_text, sidebar_x + 10, y_pos, white);
-    y_pos += 18;
-
-    renderTextLine(renderer, font_small, "Press 'M' to toggle", sidebar_x + 10, y_pos, SDL_Color{ 150, 150, 150, 255 });
+    y_pos += 15;  // Reduced from 43
+    
+    renderTextLine(renderer, font_small, "Press 'M' to toggle", sidebar_x + 10, y_pos, SDL_Color{120, 120, 120, 255});
+    y_pos += 20;  // Reduced from 25
+    
+    // SIGNATURE ISOLATION (NEW!)
+    SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
+    SDL_RenderDrawLine(renderer, sidebar_x + 10, y_pos, sidebar_x + SIDEBAR_WIDTH - 10, y_pos);
+    y_pos += 8;
+    
+    renderTextLine(renderer, font, "Signature Isolation", sidebar_x + 10, y_pos, white);
+    y_pos += 20;
+    
+    // Isolation toggle status
+    const char* iso_status = signature_isolation ? "ON (only top % shown)" : "OFF (full range)";
+    SDL_Color iso_color = signature_isolation ? 
+        SDL_Color{255, 100, 100, 255} :  // Red for ON
+        SDL_Color{100, 100, 100, 255};   // Gray for OFF
+    renderTextLine(renderer, font_small, iso_status, sidebar_x + 10, y_pos, iso_color);
+    y_pos += 15;
+    
+    // Only show slider in RELATIVE mode
+    if (color_mode == RELATIVE) {
+        renderTextLine(renderer, font_small, "Press 'I' to toggle", sidebar_x + 10, y_pos, SDL_Color{120, 120, 120, 255});
+        y_pos += 15;
+        
+        if (signature_isolation) {
+            // Percentile slider
+            renderTextLine(renderer, font_small, "Top Percentile:", sidebar_x + 10, y_pos, white);
+            y_pos += 15;
+            
+            int iso_slider_x = sidebar_x + 10;
+            int iso_slider_y = y_pos;
+            int iso_slider_width = 280;
+            int iso_slider_height = 15;
+            
+            SDL_SetRenderDrawColor(renderer, 60, 60, 60, 255);
+            SDL_Rect iso_slider_bg = { iso_slider_x, iso_slider_y, iso_slider_width, iso_slider_height };
+            SDL_RenderFillRect(renderer, &iso_slider_bg);
+            
+            // Map 1% to 20% range
+            float iso_normalized = (isolation_percentile - 0.01f) / 0.19f;  // 0.01 to 0.20
+            int iso_fill_width = (int)(iso_slider_width * iso_normalized);
+            SDL_SetRenderDrawColor(renderer, 255, 100, 100, 255);
+            SDL_Rect iso_slider_fill = { iso_slider_x, iso_slider_y, iso_fill_width, iso_slider_height };
+            SDL_RenderFillRect(renderer, &iso_slider_fill);
+            
+            int iso_handle_x = iso_slider_x + iso_fill_width - 4;
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+            SDL_Rect iso_slider_handle = { iso_handle_x, iso_slider_y - 2, 8, iso_slider_height + 4 };
+            SDL_RenderFillRect(renderer, &iso_slider_handle);
+            
+            // Handle slider interaction
+            if (mouse_down && mouse_y >= iso_slider_y && mouse_y <= iso_slider_y + iso_slider_height &&
+                mouse_x >= iso_slider_x && mouse_x <= iso_slider_x + iso_slider_width) {
+                float new_normalized = (float)(mouse_x - iso_slider_x) / iso_slider_width;
+                new_normalized = std::max(0.0f, std::min(1.0f, new_normalized));
+                isolation_percentile = 0.01f + (new_normalized * 0.19f);  // 1% to 20%
+            }
+            
+            y_pos += 18;
+            char iso_text[50];
+            snprintf(iso_text, sizeof(iso_text), "%.1f%% (1-20%%)", isolation_percentile * 100);
+            renderTextLine(renderer, font_small, iso_text, sidebar_x + 10, y_pos, white);
+            y_pos += 15;
+        } else {
+            y_pos += 15;
+        }
+    } else {
+        renderTextLine(renderer, font_small, "(Only in RELATIVE mode)", sidebar_x + 10, y_pos, SDL_Color{100, 100, 100, 255});
+        y_pos += 15;
+    }
+    y_pos += 5;
+    
+    // DISTANCE MEASUREMENT (ALWAYS VISIBLE)
+    SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
+    SDL_RenderDrawLine(renderer, sidebar_x + 10, y_pos, sidebar_x + SIDEBAR_WIDTH - 10, y_pos);
+    y_pos += 8;  // Reduced from 12
+    
+    renderTextLine(renderer, font, "Distance to Glass", sidebar_x + 10, y_pos, white);
+    y_pos += 20;  // Reduced from 25
+    
+    if (distance_detected) {
+        // Lock status
+        const char* lock_status = signature_locked ? "LOCKED ✓" : "Unlocked";
+        SDL_Color lock_color = signature_locked ? 
+            SDL_Color{0, 255, 100, 255} :  // Green for locked
+            SDL_Color{200, 100, 100, 255};  // Red for unlocked
+        renderTextLine(renderer, font_small, lock_status, sidebar_x + 10, y_pos, lock_color);
+        y_pos += 15;
+        
+        // Large distance display
+        char dist_text[100];
+        snprintf(dist_text, sizeof(dist_text), "%.2f cm", distance_cm);
+        
+        SDL_Color dist_color = {0, 255, 100, 255};  // Bright green
+        renderTextLine(renderer, font, dist_text, sidebar_x + 10, y_pos, dist_color);
+        y_pos += 20;  // Reduced from 25
+        
+        // Meters
+        snprintf(dist_text, sizeof(dist_text), "(%.3f m)", distance_m);
+        renderTextLine(renderer, font_small, dist_text, sidebar_x + 10, y_pos, white);
+        y_pos += 15;  // Reduced from 18
+        
+        // Instructions
+        if (!signature_locked) {
+            renderTextLine(renderer, font_small, "(Auto-locks on detection)", sidebar_x + 10, y_pos, SDL_Color{150, 150, 150, 255});
+        } else {
+            renderTextLine(renderer, font_small, "Press 'U' to unlock", sidebar_x + 10, y_pos, SDL_Color{150, 150, 150, 255});
+        }
+    } else {
+        if (signature_locked) {
+            renderTextLine(renderer, font_small, "Locked but lost tracking", sidebar_x + 10, y_pos, SDL_Color{200, 100, 100, 255});
+            y_pos += 15;
+            renderTextLine(renderer, font_small, "Press 'U' to unlock", sidebar_x + 10, y_pos, SDL_Color{150, 150, 150, 255});
+        } else {
+            renderTextLine(renderer, font_small, "No red pixels detected", sidebar_x + 10, y_pos, SDL_Color{200, 100, 100, 255});
+            y_pos += 15;
+            renderTextLine(renderer, font_small, "(Adjust isolation %)", sidebar_x + 10, y_pos, SDL_Color{150, 150, 150, 255});
+        }
+    }
 }
 
 void handle_camera_frame_available(seekcamera_t* camera, seekcamera_frame_t* camera_frame, void* user_data) {
@@ -630,9 +1131,11 @@ void handle_camera_frame_available(seekcamera_t* camera, seekcamera_frame_t* cam
         int height = seekframe_get_height(thermal_frame);
 
         if (temps && width > 0 && height > 0) {
-            renderer->detected_objects = detectHotObjects(temps, width, height,
+            // Detect red pixels (top percentile - the visible signature)
+            renderer->detected_objects = detectRedPixels(temps, width, height,
                 renderer->next_object_id,
-                renderer->user_temp_threshold);
+                renderer->signature_isolation,
+                renderer->isolation_percentile);
 
             int center_x = width / 2;
             int center_y = height / 2;
@@ -791,19 +1294,25 @@ int main() {
     signal(SIGINT, signal_callback);
     signal(SIGTERM, signal_callback);
 
-    std::cout << "Thermal Object Tracker - Hybrid Color Mapping" << std::endl;
-    std::cout << "==============================================" << std::endl;
+    std::cout << "Thermal Object Tracker - Gradient Pattern Recognition" << std::endl;
+    std::cout << "======================================================" << std::endl;
     std::cout << "Features:" << std::endl;
-    std::cout << "- HYBRID system: Toggle between ABSOLUTE and RELATIVE" << std::endl;
-    std::cout << "- ABSOLUTE mode: 22-30 C fixed (optimized for low-temp sources)" << std::endl;
-    std::cout << "- RELATIVE mode: Frame min/max (for debugging)" << std::endl;
-    std::cout << "- Custom color mapping bypasses hardware palette!" << std::endl;
-    std::cout << "- Blue (cool) -> Cyan -> Green -> Yellow -> Red (hot)" << std::endl;
+    std::cout << "- GRADIENT ANALYSIS: Detects signature by temperature pattern" << std::endl;
+    std::cout << "- Pattern matching: Peak temperature + radial decline" << std::endl;
+    std::cout << "- Ignores flat temperature regions (hands, walls, etc.)" << std::endl;
+    std::cout << "- Auto-locks to best matching signature" << std::endl;
+    std::cout << "- Size-based distance (adapts as signature grows/shrinks)" << std::endl;
+    std::cout << "\nSignature Characteristics:" << std::endl;
+    std::cout << "- Small concentrated dot (3x3 to 20x20 pixels)" << std::endl;
+    std::cout << "- Hot center with gradual temperature decline" << std::endl;
+    std::cout << "- Consistent pattern regardless of distance" << std::endl;
     std::cout << "\nControls:" << std::endl;
-    std::cout << "- Press 'M' to toggle between ABSOLUTE/RELATIVE modes" << std::endl;
+    std::cout << "- Press 'M' to toggle ABSOLUTE/RELATIVE color modes" << std::endl;
+    std::cout << "- Press 'I' to toggle Signature Isolation" << std::endl;
+    std::cout << "- Press 'U' to UNLOCK and redetect" << std::endl;
+    std::cout << "- Drag red slider to adjust isolation % (1-20%)" << std::endl;
     std::cout << "- Press 'Q' to quit" << std::endl;
-    std::cout << "- Drag slider (20-100 C) to set detection threshold" << std::endl;
-    std::cout << "\nStarting in ABSOLUTE mode (22-30 C optimized for your heat source)\n" << std::endl;
+    std::cout << "\nDefault: RELATIVE + Isolation @ 10% → Auto-detects gradient!\n" << std::endl;
 
     SDL_Init(SDL_INIT_VIDEO);
     TTF_Init();
@@ -821,6 +1330,9 @@ int main() {
         std::cerr << "Failed to register event callback: " << seekcamera_error_get_str(status) << std::endl;
         return 1;
     }
+
+    // Initialize triangulation distance sensor
+    TriangulationDistanceSensor distance_sensor;
 
     while (!g_exit_requested.load()) {
         std::unique_lock<std::mutex> event_lock(g_mutex);
@@ -909,17 +1421,18 @@ int main() {
                         for (int y = 0; y < frame_height; y++) {
                             for (int x = 0; x < frame_width; x++) {
                                 float temp = temps[y * frame_width + x];
-
+                                
                                 SDL_Color color;
                                 if (renderer->color_mode == ABSOLUTE) {
-                                    // ABSOLUTE: Fixed 20-70°C range
+                                    // ABSOLUTE: Fixed 24-28°C range
                                     color = mapTemperatureAbsolute(temp);
+                                } else {
+                                    // RELATIVE: Frame min/max with optional isolation
+                                    color = mapTemperatureRelative(temp, min_temp, max_temp, 
+                                                                    renderer->signature_isolation,
+                                                                    renderer->isolation_percentile);
                                 }
-                                else {
-                                    // RELATIVE: Frame min/max for maximum visibility
-                                    color = mapTemperatureRelative(temp, min_temp, max_temp);
-                                }
-
+                                
                                 // Convert to ARGB8888
                                 Uint32 pixel = (255 << 24) | (color.r << 16) | (color.g << 8) | color.b;
                                 pixels[y * (pitch / 4) + x] = pixel;
@@ -950,12 +1463,30 @@ int main() {
 
                         drawCenterCrosshair(renderer->renderer, renderer->font,
                             window_width - SIDEBAR_WIDTH, window_height,
-                            renderer->center_pixel_temp, renderer->user_temp_threshold);
+                            renderer->center_pixel_temp);
+
+                        // Measure distance using SIZE-BASED method with LOCKING
+                        TriangulationDistanceSensor::DistanceResult distance_result = 
+                            distance_sensor.measure(renderer->detected_objects);
+                        
+                        // Print distance to console if detected
+                        if (distance_result.detected) {
+                            std::cout << (distance_result.is_locked ? "[LOCKED] " : "[Unlocked] ")
+                                      << "Distance: " << distance_result.distance_cm << " cm | " 
+                                      << "Area: " << distance_result.pixel_area << " px² | " 
+                                      << "Size: " << distance_result.pixel_width << "x" 
+                                      << distance_result.pixel_height << " | Temp: " 
+                                      << distance_result.avg_temp << "°C" << std::endl;
+                        }
 
                         drawSidebar(renderer->renderer, renderer->font, renderer->font_small,
                             renderer->detected_objects, renderer->center_pixel_temp,
-                            center_x_thermal, center_y_thermal, renderer->user_temp_threshold,
-                            renderer->color_mode, window_width, window_height,
+                            center_x_thermal, center_y_thermal,
+                            renderer->color_mode, renderer->signature_isolation, 
+                            renderer->isolation_percentile,
+                            distance_result.detected, distance_result.is_locked,
+                            distance_result.distance_m, distance_result.distance_cm,
+                            window_width, window_height, 
                             renderer->mouse_x, renderer->mouse_y, renderer->mouse_down);
 
                         SDL_RenderPresent(renderer->renderer);
@@ -984,13 +1515,32 @@ int main() {
                 for (std::map<std::string, seekrenderer_t*>::iterator it = g_renderers.begin();
                     it != g_renderers.end(); ++it) {
                     if (it->second != nullptr) {
-                        it->second->color_mode = (it->second->color_mode == ABSOLUTE) ?
+                        it->second->color_mode = (it->second->color_mode == ABSOLUTE) ? 
                             RELATIVE : ABSOLUTE;
-                        std::cout << "Color mode: " <<
-                            ((it->second->color_mode == ABSOLUTE) ? "ABSOLUTE" : "RELATIVE")
+                        std::cout << "Color mode: " << 
+                            ((it->second->color_mode == ABSOLUTE) ? "ABSOLUTE" : "RELATIVE") 
                             << std::endl;
                     }
                 }
+            }
+            else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_i) {
+                // Toggle signature isolation with 'I' key
+                for (std::map<std::string, seekrenderer_t*>::iterator it = g_renderers.begin();
+                    it != g_renderers.end(); ++it) {
+                    if (it->second != nullptr) {
+                        it->second->signature_isolation = !it->second->signature_isolation;
+                        std::cout << "Signature isolation: " << 
+                            (it->second->signature_isolation ? "ON" : "OFF");
+                        if (it->second->signature_isolation) {
+                            std::cout << " (top " << (it->second->isolation_percentile * 100) << "%)";
+                        }
+                        std::cout << std::endl;
+                    }
+                }
+            }
+            else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_u) {
+                // Unlock signature with 'U' key
+                distance_sensor.unlockSignature();
             }
             else if (event.type == SDL_MOUSEMOTION) {
                 for (std::map<std::string, seekrenderer_t*>::iterator it = g_renderers.begin();
