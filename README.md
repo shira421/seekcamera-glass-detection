@@ -127,7 +127,8 @@ User controls:
 └─────────────────────────────────────┴──────────────────┘
 ```
 
-<img width="1411" height="765" alt="image" src="https://github.com/user-attachments/assets/2533b53e-d10a-4018-97b4-ab8adfc1c258" />
+<img width="1402" height="757" alt="image" src="https://github.com/user-attachments/assets/0781e4b1-5f1d-498e-97ef-9822b9b70f2a" />
+
 
 ## Algorithm Details
 
