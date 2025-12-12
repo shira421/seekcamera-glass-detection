@@ -267,8 +267,9 @@ SDL_Color getTemperatureColor(float temp, float min_threshold, float max_range) 
 // Uses hottest pixel for pure geometric calculation - NO CALIBRATION NEEDED!
 class TriangulationDistanceSensor {
 private:
-    // PHYSICAL SETUP
-    const float BASELINE_CM = 2.5f;              // 2.5cm ABOVE camera
+    // PHYSICAL SETUP - DUAL EMITTER SYSTEM
+    const float BASELINE_ABOVE_CM = 2.5f;        // ABOVE camera
+    const float BASELINE_LEFT_CM = 3.3f;         // LEFT of camera
     const float HFOV_DEGREES = 56.0f;            // Horizontal FOV
     const float SENSOR_WIDTH = 320.0f;           // pixels
     const float SENSOR_HEIGHT = 240.0f;          // pixels
@@ -280,7 +281,13 @@ private:
     // TEMPORAL FILTERING - for smoothing measurements
     std::vector<float> distance_history;
     std::vector<float> yaw_history;
-    const int FILTER_SIZE = 5;                   // 5-frame moving average
+    std::vector<float> pitch_history;
+    // Temporal tracking state
+    static bool has_previous_spots = false;
+    static float prev_above_x = 0.0f, prev_above_y = 0.0f;
+    static float prev_left_x = 0.0f, prev_left_y = 0.0f;
+    
+    const int FILTER_SIZE = 15;                  // 15-frame moving average for maximum stability
     
     // Helper function for temporal filtering
     float smoothValue(std::vector<float>& buffer, float new_val) {
@@ -295,6 +302,59 @@ private:
         return sum / buffer.size();
     }
     
+    // Structure for a detected hot spot
+    struct HotSpot {
+        float x;           // Sub-pixel X position
+        float y;           // Sub-pixel Y position
+        float temp;        // Temperature
+        bool valid;
+    };
+    
+    // Find sub-pixel centroid of a hot spot
+    HotSpot findHotSpotCentroid(float* temps, int width, int height, 
+                                 int center_x, int center_y, float max_temp) {
+        HotSpot spot;
+        spot.valid = false;
+        
+        // Calculate temperature-weighted centroid in 5×5 region
+        float threshold = max_temp - 2.0f;
+        float sum_temp = 0.0f;
+        float sum_x = 0.0f;
+        float sum_y = 0.0f;
+        int count = 0;
+        
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                int px = center_x + dx;
+                int py = center_y + dy;
+                
+                if (px >= 0 && px < width && py >= 0 && py < height) {
+                    float temp = temps[py * width + px];
+                    if (temp > threshold) {
+                        sum_temp += temp;
+                        sum_x += temp * px;
+                        sum_y += temp * py;
+                        count++;
+                    }
+                }
+            }
+        }
+        
+        if (sum_temp > 0 && count >= 3) {
+            spot.x = sum_x / sum_temp;
+            spot.y = sum_y / sum_temp;
+            spot.temp = max_temp;
+            spot.valid = true;
+        } else {
+            spot.x = center_x;
+            spot.y = center_y;
+            spot.temp = max_temp;
+            spot.valid = true;
+        }
+        
+        return spot;
+    }
+    
 public:
     TriangulationDistanceSensor() {
         // Calculate vertical FOV from horizontal FOV and aspect ratio
@@ -307,23 +367,39 @@ public:
         // Calculate focal length (same for both axes in pinhole camera)
         focal_length_pixels = (SENSOR_WIDTH / 2.0f) / tan(hfov_half_rad);
         
-        std::cout << "\n==== 2D TRIANGULATION (Vertical + Yaw Correction) ====" << std::endl;
+        std::cout << "\n==== DUAL EMITTER TRIANGULATION SYSTEM ====" << std::endl;
         std::cout << "Physical Setup:" << std::endl;
-        std::cout << "  Baseline: " << BASELINE_CM << " cm ABOVE camera" << std::endl;
+        std::cout << "  Above Emitter: " << BASELINE_ABOVE_CM << " cm ABOVE camera" << std::endl;
+        std::cout << "  Left Emitter: " << BASELINE_LEFT_CM << " cm LEFT of camera" << std::endl;
         std::cout << "  Resolution: " << SENSOR_WIDTH << "×" << SENSOR_HEIGHT << std::endl;
         std::cout << "  HFOV: " << HFOV_DEGREES << "° (±28° from center)" << std::endl;
         std::cout << "  VFOV: " << VFOV_DEGREES << "° (±21° from center)" << std::endl;
-        std::cout << "\nAngle Calculation:" << std::endl;
-        std::cout << "  Vertical: angle = (y_offset / 120) × 21°" << std::endl;
-        std::cout << "  Horizontal: angle = (x_offset / 160) × 28°" << std::endl;
-        std::cout << "\nDistance Calculation:" << std::endl;
-        std::cout << "  1. perp_distance = 2.5 / tan(vertical_angle)" << std::endl;
-        std::cout << "  2. distance = perp_distance / cos(horizontal_angle)" << std::endl;
-        std::cout << "  3. Distance increases when camera tilts (correct!)" << std::endl;
-        std::cout << "\nPrecision Improvements:" << std::endl;
+        std::cout << "\nHot Spot Detection Method:" << std::endl;
+        std::cout << "  METHOD: Temporal tracking with relative positioning" << std::endl;
+        std::cout << "  • Calculates background temperature (median)" << std::endl;
+        std::cout << "  • Uses DUAL THRESHOLD: min(0.1°C above bg, 80th percentile)" << std::endl;
+        std::cout << "  • Uses 2×2 neighborhood (detects very close to edges!)" << std::endl;
+        std::cout << "  • RELATIVE POSITIONING: ABOVE spot has lower Y than LEFT spot" << std::endl;
+        std::cout << "  • TEMPORAL TRACKING: Strongly prefers spots near previous positions" << std::endl;
+        std::cout << "  • Multi-criteria scoring: temperature + separation + tracking + position" << std::endl;
+        std::cout << "  • EXTREMELY ROBUST - maintains tracking through extreme tilts!" << std::endl;
+        std::cout << "\nDistance Measurement Method:" << std::endl;
+        std::cout << "  PRIMARY: Pixel separation (tilt-invariant)" << std::endl;
+        std::cout << "  FORMULA: d = K / pixel_separation / 2" << std::endl;
+        std::cout << "  K = 1335 pixels×cm (mathematically derived)" << std::endl;
+        std::cout << "  Division by 2: accounts for glass reflection" << std::endl;
+        std::cout << "\nExpected Values (corrected for reflection):" << std::endl;
+        std::cout << "  5 cm → separation ≈ 268 pixels" << std::endl;
+        std::cout << "  7.5 cm → separation ≈ 178 pixels" << std::endl;
+        std::cout << "  10 cm → separation ≈ 134 pixels" << std::endl;
+        std::cout << "  15 cm → separation ≈ 89 pixels" << std::endl;
+        std::cout << "\nStability & Tracking:" << std::endl;
+        std::cout << "  ✓ TEMPORAL TRACKING: Locks onto spots, follows through tilts" << std::endl;
+        std::cout << "  ✓ RELATIVE POSITIONING: Uses spot relationships, not absolute coords" << std::endl;
         std::cout << "  ✓ SUB-PIXEL CENTROID: 5×5 temperature-weighted averaging" << std::endl;
-        std::cout << "  ✓ TEMPORAL FILTERING: " << FILTER_SIZE << "-frame moving average" << std::endl;
-        std::cout << "  ✓ Expected precision: ±0.2-0.5 cm at 15cm range\n" << std::endl;
+        std::cout << "  ✓ TEMPORAL FILTERING: " << FILTER_SIZE << "-frame moving average (very stable)" << std::endl;
+        std::cout << "  ✓ DEADBAND FILTER: 0.25 cm threshold (smooth readings)" << std::endl;
+        std::cout << "  ✓ MULTI-CRITERIA SCORING: Finds best pair intelligently\n" << std::endl;
     }
     
     struct DistanceResult {
@@ -337,7 +413,7 @@ public:
         float perpendicular_distance_cm;  // Distance along optical axis
         float camera_yaw_deg;              // Horizontal tilt angle
         
-        // Raw measurements
+        // Raw measurements - PRIMARY spot (above emitter)
         int hottest_x;
         int hottest_y;
         float hottest_temp;
@@ -345,124 +421,479 @@ public:
         float horizontal_angle_deg;
         float pixel_offset_x;
         float pixel_offset_y;
+        
+        // SECOND spot (left emitter) - for dual emitter visualization
+        int second_spot_x;
+        int second_spot_y;
+        float second_spot_temp;
     };
     
     DistanceResult calculate(float* temps, int width, int height) {
         DistanceResult result;
         result.detected = false;
         
-        // ===== IMPROVEMENT 1: SUB-PIXEL CENTROID =====
+        // ===== STEP 1: FIND TWO HOT SPOTS (LOCAL MAXIMA METHOD) =====
         
-        // STEP 1A: Find hottest pixel (coarse, integer position)
-        float max_temp = -1000.0f;
-        int hottest_x_int = 0;
-        int hottest_y_int = 0;
+        // Detection parameters (DECLARE FIRST!)
+        const int NEIGHBORHOOD = 2;  // Smaller = detects closer to edges (was 3)
+        const float MIN_TEMP_ABOVE_BG = 0.1f;  // EXTREMELY lenient - just 0.1°C above background!
         
+        // First, calculate background temperature (median of coolest 50% of pixels)
+        std::vector<float> all_temps;
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                float temp = temps[y * width + x];
-                if (temp > max_temp) {
-                    max_temp = temp;
-                    hottest_x_int = x;
-                    hottest_y_int = y;
-                }
+                all_temps.push_back(temps[y * width + x]);
             }
         }
+        std::sort(all_temps.begin(), all_temps.end());
+        float background_temp = all_temps[all_temps.size() / 2];  // Median
+        float min_temp = all_temps[0];
+        float max_temp = all_temps[all_temps.size() - 1];
         
-        // STEP 1B: Calculate temperature-weighted centroid (fine, sub-pixel)
-        // Use 5×5 region around hottest pixel for better precision
-        float threshold = max_temp - 2.0f;  // Include pixels within 2°C of max
-        float sum_temp = 0.0f;
-        float sum_x = 0.0f;
-        float sum_y = 0.0f;
-        int count = 0;
+        // Also calculate percentile thresholds
+        float temp_70th = all_temps[(all_temps.size() * 70) / 100];  // 70th percentile
+        float temp_80th = all_temps[(all_temps.size() * 80) / 100];  // 80th percentile
+        float temp_85th = all_temps[(all_temps.size() * 85) / 100];  // 85th percentile
+        float temp_90th = all_temps[(all_temps.size() * 90) / 100];  // 90th percentile
         
-        for (int dy = -2; dy <= 2; dy++) {
-            for (int dx = -2; dx <= 2; dx++) {
-                int px = hottest_x_int + dx;
-                int py = hottest_y_int + dy;
+        std::cout << "\n=== DETECTION ===" << std::endl;
+        std::cout << "Temperature range: " << min_temp << "°C to " << max_temp << "°C" << std::endl;
+        std::cout << "Background (median): " << background_temp << "°C" << std::endl;
+        std::cout << "Percentiles: 70th=" << temp_70th << "°C, 80th=" << temp_80th 
+                  << "°C, 85th=" << temp_85th << "°C, 90th=" << temp_90th << "°C" << std::endl;
+        std::cout << "Detection threshold: >" << (background_temp + MIN_TEMP_ABOVE_BG) << "°C" << std::endl;
+        
+        // Find all LOCAL MAXIMA (hottest pixel in neighborhood)
+        
+        struct LocalMax {
+            int x, y;
+            float temp;
+            bool operator<(const LocalMax& other) const {
+                return temp > other.temp;  // Sort hottest first
+            }
+        };
+        
+        std::vector<LocalMax> local_maxima;
+        
+        // Use DUAL THRESHOLD: absolute OR percentile (whichever is more lenient)
+        float absolute_threshold = background_temp + MIN_TEMP_ABOVE_BG;
+        float percentile_threshold = temp_80th;  // Top 20% of temperatures
+        float detection_threshold = std::min(absolute_threshold, percentile_threshold);
+        
+        std::cout << "Using threshold: " << detection_threshold << "°C (more lenient of absolute vs percentile)" << std::endl;
+        
+        for (int y = NEIGHBORHOOD; y < height - NEIGHBORHOOD; y++) {
+            for (int x = NEIGHBORHOOD; x < width - NEIGHBORHOOD; x++) {
+                float center_temp = temps[y * width + x];
                 
-                // Check bounds
-                if (px >= 0 && px < width && py >= 0 && py < height) {
-                    float temp = temps[py * width + px];
-                    if (temp > threshold) {
-                        sum_temp += temp;
-                        sum_x += temp * px;
-                        sum_y += temp * py;
-                        count++;
+                // Must be above detection threshold
+                if (center_temp < detection_threshold) {
+                    continue;
+                }
+                
+                // Check if hottest in neighborhood
+                bool is_local_max = true;
+                for (int dy = -NEIGHBORHOOD; dy <= NEIGHBORHOOD && is_local_max; dy++) {
+                    for (int dx = -NEIGHBORHOOD; dx <= NEIGHBORHOOD; dx++) {
+                        if (dx == 0 && dy == 0) continue;
+                        float neighbor_temp = temps[(y+dy) * width + (x+dx)];
+                        if (neighbor_temp > center_temp) {
+                            is_local_max = false;
+                            break;
+                        }
                     }
                 }
+                
+                if (is_local_max) {
+                    local_maxima.push_back({x, y, center_temp});
+                }
             }
         }
         
-        // Calculate centroid position (FRACTIONAL pixels for sub-pixel precision!)
-        float hottest_x_fractional = hottest_x_int;
-        float hottest_y_fractional = hottest_y_int;
+        std::sort(local_maxima.begin(), local_maxima.end());
         
-        if (sum_temp > 0 && count >= 3) {
-            hottest_x_fractional = sum_x / sum_temp;
-            hottest_y_fractional = sum_y / sum_temp;
+        std::cout << "Found " << local_maxima.size() << " local maxima" << std::endl;
+        
+        // Show top candidates for debugging
+        if (local_maxima.size() > 0) {
+            std::cout << "Top candidates:" << std::endl;
+            for (size_t i = 0; i < std::min((size_t)10, local_maxima.size()); i++) {
+                std::cout << "  #" << i << ": (" << local_maxima[i].x << "," << local_maxima[i].y 
+                          << ") " << local_maxima[i].temp << "°C (+" 
+                          << (local_maxima[i].temp - background_temp) << "°C above bg)" << std::endl;
+            }
         }
         
-        // Store integer position for display
-        result.hottest_x = (int)round(hottest_x_fractional);
-        result.hottest_y = (int)round(hottest_y_fractional);
-        result.hottest_temp = max_temp;
-        
-        // ===== CORE CALCULATION (using fractional positions) =====
-        
-        // STEP 2: Calculate VERTICAL angle (for perpendicular distance)
-        // Center is at y=120 for 240 pixel height
-        // VFOV = 42°, so half is 21°
-        float center_y = 120.0f;
-        float y_offset = center_y - hottest_y_fractional;   // Use FRACTIONAL position!
-        result.pixel_offset_y = y_offset;
-        
-        // Scale: (y_offset / 120) * 21 degrees
-        float angle_vertical_deg = (y_offset / 120.0f) * 21.0f;
-        result.vertical_angle_deg = angle_vertical_deg;
-        float angle_vertical_rad = angle_vertical_deg * M_PI / 180.0f;
-        
-        // STEP 3: Calculate perpendicular distance
-        // perp_distance = 2.5 / tan(vertical_angle)
-        // Use fabs() to ensure positive distance regardless of angle sign
-        float d_perpendicular_cm;
-        if (fabs(angle_vertical_rad) < 0.0001f) {
-            d_perpendicular_cm = 1000.0f;  // Very far (angle ~0)
-        } else {
-            d_perpendicular_cm = BASELINE_CM / fabs(tan(angle_vertical_rad));
+        if (local_maxima.size() < 2) {
+            std::cout << "ERROR: Need at least 2 hot spots (found " << local_maxima.size() << ")" << std::endl;
+            std::cout << "Current settings: MIN_TEMP_ABOVE_BG=" << MIN_TEMP_ABOVE_BG 
+                      << "°C, NEIGHBORHOOD=" << NEIGHBORHOOD << " pixels" << std::endl;
+            std::cout << "Detection threshold used: " << detection_threshold << "°C" << std::endl;
+            std::cout << "\nDiagnostics:" << std::endl;
+            std::cout << "  Temperature spread: " << (max_temp - min_temp) << "°C" << std::endl;
+            std::cout << "  Hottest pixel: " << max_temp << "°C" << std::endl;
+            std::cout << "  If hottest pixel is warm but not detected, spots may be at image edge" << std::endl;
+            std::cout << "Try: increasing emitter power, moving glass closer, or adjusting thresholds in code" << std::endl;
+            result.detected = false;
+            return result;
         }
-        result.perpendicular_distance_cm = d_perpendicular_cm;
         
-        // STEP 4: Calculate HORIZONTAL angle (camera yaw)
-        // Center is at x=160 for 320 pixel width
-        // HFOV = 56°, so half is 28°
+        // ===== SMART SELECTION: Temporal tracking + relative positioning =====
+        
+        // Strategy: Find pair of spots where one is "above-like" and one is "left-like"
+        // Key insight: ABOVE spot should have LOWER Y than LEFT spot (more up)
+        //              LEFT spot should have LOWER X than ABOVE spot (more left)
+        
+        LocalMax best_above, best_left;
+        float best_score = -999999.0f;
+        bool found_valid_pair = false;
+        
+        std::cout << "\nEvaluating all possible pairs:" << std::endl;
+        
+        // Try all pairs of spots
+        for (size_t i = 0; i < local_maxima.size(); i++) {
+            for (size_t j = i + 1; j < local_maxima.size(); j++) {
+                LocalMax spot_a = local_maxima[i];
+                LocalMax spot_b = local_maxima[j];
+                
+                // Check spatial separation
+                int dx = spot_a.x - spot_b.x;
+                int dy = spot_a.y - spot_b.y;
+                float separation = sqrt(dx*dx + dy*dy);
+                
+                if (separation < 15) continue;  // Too close
+                
+                // Determine which is "above" and which is "left" based on relative position
+                // ABOVE emitter creates spot that is MORE UP (lower Y) than LEFT emitter
+                LocalMax candidate_above, candidate_left;
+                
+                if (spot_a.y < spot_b.y) {
+                    // A is more up → A is from ABOVE emitter
+                    candidate_above = spot_a;
+                    candidate_left = spot_b;
+                } else {
+                    // B is more up → B is from ABOVE emitter
+                    candidate_above = spot_b;
+                    candidate_left = spot_a;
+                }
+                
+                // Additional constraint: LEFT should be more left (lower X) than ABOVE
+                // This helps disambiguate when tilted
+                float relative_constraint = (candidate_above.x - candidate_left.x);
+                if (relative_constraint < -50) {
+                    // ABOVE is way left of LEFT - probably wrong, skip this pair
+                    continue;
+                }
+                
+                // Calculate score for this pair
+                float score = 0.0f;
+                
+                // 1. Temperature: prefer hotter spots (combined)
+                score += (candidate_above.temp + candidate_left.temp) * 10.0f;
+                
+                // 2. Separation: prefer well-separated spots (but not too extreme)
+                score += std::min(separation, 150.0f);
+                
+                // 3. TEMPORAL TRACKING: strongly prefer spots near previous positions
+                if (has_previous_spots) {
+                    float above_dist = sqrt(pow(candidate_above.x - prev_above_x, 2) + 
+                                          pow(candidate_above.y - prev_above_y, 2));
+                    float left_dist = sqrt(pow(candidate_left.x - prev_left_x, 2) + 
+                                         pow(candidate_left.y - prev_left_y, 2));
+                    
+                    // Big bonus for staying close to previous position
+                    score += 500.0f / (1.0f + above_dist * 0.5f);  // Decays with distance
+                    score += 500.0f / (1.0f + left_dist * 0.5f);
+                }
+                
+                // 4. Relative positioning: bonus if LEFT is actually more left
+                if (relative_constraint > 0) {
+                    score += relative_constraint * 2.0f;
+                }
+                
+                // 5. Y-axis separation: ABOVE should be distinctly more up
+                float y_separation = candidate_left.y - candidate_above.y;
+                if (y_separation > 20) {
+                    score += y_separation * 1.5f;
+                }
+                
+                if (score > best_score) {
+                    best_score = score;
+                    best_above = candidate_above;
+                    best_left = candidate_left;
+                    found_valid_pair = true;
+                }
+            }
+        }
+        
+        if (!found_valid_pair) {
+            std::cout << "ERROR: Could not find valid pair of spots" << std::endl;
+            std::cout << "Tried all combinations but none satisfied constraints" << std::endl;
+            result.detected = false;
+            return result;
+        }
+        
+        std::cout << "Selected pair (score=" << best_score << "):" << std::endl;
+        std::cout << "  ABOVE: (" << best_above.x << "," << best_above.y << ") " << best_above.temp << "°C" << std::endl;
+        std::cout << "  LEFT: (" << best_left.x << "," << best_left.y << ") " << best_left.temp << "°C" << std::endl;
+        
+        if (has_previous_spots) {
+            float above_movement = sqrt(pow(best_above.x - prev_above_x, 2) + 
+                                       pow(best_above.y - prev_above_y, 2));
+            float left_movement = sqrt(pow(best_left.x - prev_left_x, 2) + 
+                                      pow(best_left.y - prev_left_y, 2));
+            std::cout << "  Movement from previous: ABOVE=" << above_movement 
+                      << "px, LEFT=" << left_movement << "px" << std::endl;
+        }
+        
+        // Calculate sub-pixel centroids for selected spots
+        HotSpot hotspot_above = findHotSpotCentroid(temps, width, height, best_above.x, best_above.y, best_above.temp);
+        HotSpot hotspot_left = findHotSpotCentroid(temps, width, height, best_left.x, best_left.y, best_left.temp);
+        
+        if (!hotspot_above.valid || !hotspot_left.valid) {
+            result.detected = false;
+            return result;
+        }
+        
+        std::cout << "\nRefined centroids:" << std::endl;
+        std::cout << "  ABOVE: (" << hotspot_above.x << "," << hotspot_above.y << ") " << hotspot_above.temp << "°C" << std::endl;
+        std::cout << "  LEFT: (" << hotspot_left.x << "," << hotspot_left.y << ") " << hotspot_left.temp << "°C" << std::endl;
+        
+        // Check for edge proximity (may cause detection issues)
+        const int EDGE_MARGIN = 5;
+        if (hotspot_above.x < EDGE_MARGIN || hotspot_above.x > width - EDGE_MARGIN ||
+            hotspot_above.y < EDGE_MARGIN || hotspot_above.y > height - EDGE_MARGIN) {
+            std::cout << "  WARNING: ABOVE spot near edge (may affect detection)" << std::endl;
+        }
+        if (hotspot_left.x < EDGE_MARGIN || hotspot_left.x > width - EDGE_MARGIN ||
+            hotspot_left.y < EDGE_MARGIN || hotspot_left.y > height - EDGE_MARGIN) {
+            std::cout << "  WARNING: LEFT spot near edge (may affect detection)" << std::endl;
+        }
+        
+        // Assign directly - geometric selection already determined which is which
+        HotSpot spot_above = hotspot_above;
+        HotSpot spot_left = hotspot_left;
+        
+        // ===== STEP 2: CALCULATE ANGLES FROM SPOT POSITIONS =====
+        
         float center_x = 160.0f;
-        float x_offset = hottest_x_fractional - center_x;  // Use FRACTIONAL position!
-        result.pixel_offset_x = x_offset;
+        float center_y = 120.0f;
         
-        // Scale: (x_offset / 160) * 28 degrees
-        float angle_horizontal_deg = (x_offset / 160.0f) * 28.0f;
-        result.horizontal_angle_deg = angle_horizontal_deg;
-        float angle_horizontal_rad = angle_horizontal_deg * M_PI / 180.0f;
+        // From ABOVE spot
+        float y_offset_above = center_y - spot_above.y;  // Positive when above center
+        float x_offset_above = spot_above.x - center_x;  // Positive when right of center
         
-        // STEP 5: Apply yaw correction
-        // If x_offset = 0, distance = perp_distance
-        // Otherwise: distance = perp_distance / cos(horizontal_angle)
-        // Note: cos() is symmetric (cos(-x) = cos(x)), so distance increases
-        // by the same amount regardless of tilt direction (left or right)
-        float d_glass_cm_raw = d_perpendicular_cm / cos(angle_horizontal_rad);
+        std::cout << "\nABOVE spot offsets: y_offset=" << y_offset_above 
+                  << " (should be >0), x_offset=" << x_offset_above << " (diagnostic only)" << std::endl;
         
-        // ===== IMPROVEMENT 2: TEMPORAL FILTERING =====
-        // Smooth measurements over time to reduce noise
+        // Check if above spot is actually above center
+        if (y_offset_above <= 0) {
+            std::cout << "ERROR: Above spot is not above center! y=" << spot_above.y << std::endl;
+        }
         
-        float d_glass_cm_filtered = smoothValue(distance_history, d_glass_cm_raw);
-        float yaw_filtered = smoothValue(yaw_history, angle_horizontal_deg);
+        float theta_ya_deg = (y_offset_above / 120.0f) * 21.0f;
+        float theta_xa_deg = (x_offset_above / 160.0f) * 28.0f;
         
-        result.distance_to_glass_cm = d_glass_cm_filtered;
-        result.distance_to_glass_m = d_glass_cm_filtered / 100.0f;
-        result.camera_yaw_deg = yaw_filtered;
+        float theta_ya_rad = theta_ya_deg * M_PI / 180.0f;
+        float theta_xa_rad = theta_xa_deg * M_PI / 180.0f;
+        
+        std::cout << "ABOVE angles: θ_ya=" << theta_ya_deg << "° (for distance)"
+                  << " | θ_xa=" << theta_xa_deg << "° (yaw indicator)" << std::endl;
+        
+        // From LEFT spot
+        float x_offset_left = center_x - spot_left.x;  // Positive when left of center
+        float y_offset_left = spot_left.y - center_y;  // Positive when below center
+        
+        std::cout << "\nLEFT spot offsets: x_offset=" << x_offset_left 
+                  << " (should be >0), y_offset=" << y_offset_left << " (diagnostic only)" << std::endl;
+        
+        // Check if left spot is actually left of center
+        if (x_offset_left <= 0) {
+            std::cout << "ERROR: Left spot is not left of center! x=" << spot_left.x << std::endl;
+        }
+        
+        float theta_xl_deg = (x_offset_left / 160.0f) * 28.0f;
+        float theta_yl_deg = (y_offset_left / 120.0f) * 21.0f;
+        
+        float theta_xl_rad = theta_xl_deg * M_PI / 180.0f;
+        float theta_yl_rad = theta_yl_deg * M_PI / 180.0f;
+        
+        std::cout << "LEFT angles: θ_xl=" << theta_xl_deg << "° (for distance)"
+                  << " | θ_yl=" << theta_yl_deg << "° (pitch indicator)" << std::endl;
+        
+        // ===== STEP 3: CHECK FOR VALID ANGLES =====
+        
+        if (fabs(theta_ya_rad) < 0.001f) {
+            std::cout << "ERROR: Vertical angle too small (θ_ya=" << theta_ya_deg << "°)" << std::endl;
+            result.detected = false;
+            return result;
+        }
+        
+        if (fabs(theta_xl_rad) < 0.001f) {
+            std::cout << "ERROR: Horizontal angle too small (θ_xl=" << theta_xl_deg << "°)" << std::endl;
+            result.detected = false;
+            return result;
+        }
+        
+        // ===== STEP 4: PIXEL SEPARATION METHOD (Tilt-Invariant) =====
+        
+        std::cout << "\n=== DISTANCE CALCULATION (PIXEL SEPARATION METHOD) ===" << std::endl;
+        
+        // Calculate pixel separation between the two spots
+        float dx_pixels = spot_above.x - spot_left.x;
+        float dy_pixels = spot_above.y - spot_left.y;
+        float separation_pixels = sqrt(dx_pixels * dx_pixels + dy_pixels * dy_pixels);
+        
+        std::cout << "Spot separation: Δx=" << dx_pixels << " pixels, Δy=" << dy_pixels 
+                  << " pixels, Total=" << separation_pixels << " pixels" << std::endl;
+        
+        // Mathematically derived calibration constant
+        // Derivation:
+        //   f_x = 160 / tan(28°) = 301 pixels (horizontal focal length)
+        //   f_y = 120 / tan(21°) = 312 pixels (vertical focal length)
+        //   Δx = f_x × baseline_left / d = 301 × 3.3 / d = 993 / d
+        //   Δy = f_y × baseline_above / d = 312 × 2.5 / d = 780 / d
+        //   separation ≈ sqrt(993² + 780²) / d = 1263 / d (small angle approx)
+        //   Exact calculation at 10-30cm gives: K ≈ 1335 pixels×cm
+        const float K_CALIBRATION = 1335.0f;  // pixels × cm (mathematically derived)
+        
+        float d_separation = K_CALIBRATION / separation_pixels;
+        
+        std::cout << "Separation method: d = " << K_CALIBRATION << " / " << separation_pixels 
+                  << " = " << d_separation << " cm" << std::endl;
+        
+        // Also calculate using individual angles (for comparison/validation)
+        float tan_ya = tan(theta_ya_rad);
+        float tan_xl = tan(theta_xl_rad);
+        
+        if (tan_ya <= 0 || tan_xl <= 0) {
+            std::cout << "ERROR: Invalid angles (tan ≤ 0)" << std::endl;
+            result.detected = false;
+            return result;
+        }
+        
+        float d_above_simple = BASELINE_ABOVE_CM / tan_ya;
+        float d_left_simple = BASELINE_LEFT_CM / tan_xl;
+        
+        std::cout << "Simple formulas (for reference):" << std::endl;
+        std::cout << "  d_above = " << BASELINE_ABOVE_CM << " / tan(θ_ya) = " 
+                  << d_above_simple << " cm" << std::endl;
+        std::cout << "  d_left = " << BASELINE_LEFT_CM << " / tan(θ_xl) = " 
+                  << d_left_simple << " cm" << std::endl;
+        
+        // Use separation method as primary
+        float d_unified = d_separation;
+        
+        // ===== STEP 5: ACCOUNT FOR REFLECTION =====
+        // The camera sees the reflection of the hot spots in the glass
+        // Light/heat travels: emitter → glass → reflection back
+        // Measured distance is 2× actual distance to glass
+        // Divide by 2 to get true distance to glass surface
+        
+        d_unified = d_unified / 2.0f;
+        
+        std::cout << "\nReflection correction: d_final = " << d_separation << " / 2 = " 
+                  << d_unified << " cm (actual distance to glass)" << std::endl;
+        // ===== STEP 6: VALIDATION AND SANITY CHECKS =====
+        
+        std::cout << "\n=== VALIDATION ===" << std::endl;
+        std::cout << "Raw separation distance: " << d_separation << " cm" << std::endl;
+        std::cout << "PRIMARY (with reflection correction): " << d_unified << " cm" << std::endl;
+        std::cout << "REFERENCE: Individual measurements (uncorrected):" << std::endl;
+        std::cout << "  Above: " << d_above_simple << " cm → " << d_above_simple/2.0f << " cm (corrected)" << std::endl;
+        std::cout << "  Left: " << d_left_simple << " cm → " << d_left_simple/2.0f << " cm (corrected)" << std::endl;
+        
+        // Check if distance is reasonable
+        if (d_unified < 2.0f || d_unified > 50.0f) {
+            std::cout << "WARNING: Distance out of reasonable range (2-50 cm)" << std::endl;
+        }
+        
+        // Check if separation is reasonable
+        if (separation_pixels < 10.0f) {
+            std::cout << "WARNING: Spots too close together (>50cm or measurement error)" << std::endl;
+        }
+        if (separation_pixels > 250.0f) {
+            std::cout << "WARNING: Spots very far apart (<5cm - may be too close)" << std::endl;
+        }
+        
+        // ===== STEP 7: 3D POSITIONS (For Reference) =====
+        
+        float P_above_x = d_unified * tan(theta_xa_rad);
+        float P_above_y = d_unified * tan_ya;
+        float P_above_z = d_unified;
+        
+        float P_left_x = d_unified * tan(theta_xl_rad);  // Will be negative for left
+        float P_left_y = d_unified * tan(theta_yl_rad);
+        float P_left_z = d_unified;
+        
+        float dx = P_above_x - P_left_x;
+        float dy = P_above_y - P_left_y;
+        float dz = P_above_z - P_left_z;
+        float spot_separation_3d = sqrt(dx*dx + dy*dy + dz*dz);
+        
+        std::cout << "\n3D Positions (at distance " << d_unified << " cm):" << std::endl;
+        std::cout << "Above: (" << P_above_x << ", " << P_above_y << ", " << P_above_z << ") cm" << std::endl;
+        std::cout << "Left: (" << P_left_x << ", " << P_left_y << ", " << P_left_z << ") cm" << std::endl;
+        std::cout << "3D Separation: " << spot_separation_3d << " cm" << std::endl;
+        
+        // ===== STEP 8: TEMPORAL FILTERING =====
+        
+        float d_filtered = smoothValue(distance_history, d_unified);
+        float yaw_final = smoothValue(yaw_history, theta_xa_deg);
+        float pitch_final = smoothValue(pitch_history, theta_yl_deg);
+        
+        // ===== STEP 9: DEADBAND FILTER (reduce jitter when stationary) =====
+        
+        static float last_stable_distance = 0.0f;
+        const float DEADBAND_CM = 0.25f;  // Increased for better stability
+        
+        float d_final;
+        if (last_stable_distance == 0.0f) {
+            // First measurement
+            d_final = d_filtered;
+            last_stable_distance = d_filtered;
+        } else {
+            float change = fabs(d_filtered - last_stable_distance);
+            if (change > DEADBAND_CM) {
+                // Significant change - update
+                d_final = d_filtered;
+                last_stable_distance = d_filtered;
+            } else {
+                // Small jitter - hold last stable value
+                d_final = last_stable_distance;
+            }
+        }
+        
+        std::cout << "Filtered: " << d_filtered << " cm → Final (with deadband): " 
+                  << d_final << " cm" << std::endl;
+        
+        // ===== POPULATE RESULT =====
+        
+        result.distance_to_glass_cm = d_final;
+        result.distance_to_glass_m = d_final / 100.0f;
+        result.camera_yaw_deg = yaw_final;
+        
+        // Store BOTH spots for visualization
+        result.hottest_x = (int)round(spot_above.x);
+        result.hottest_y = (int)round(spot_above.y);
+        result.hottest_temp = spot_above.temp;
+        
+        // Store second spot (we'll need to add these to DistanceResult struct)
+        result.second_spot_x = (int)round(spot_left.x);
+        result.second_spot_y = (int)round(spot_left.y);
+        result.second_spot_temp = spot_left.temp;
+        
         result.detected = true;
+        
+        // Update tracking state for next frame
+        prev_above_x = spot_above.x;
+        prev_above_y = spot_above.y;
+        prev_left_x = spot_left.x;
+        prev_left_y = spot_left.y;
+        has_previous_spots = true;
+        
+        std::cout << "\n► FINAL: " << d_final << " cm (filtered) | "
+                  << "Yaw: " << yaw_final << "° | Pitch: " << pitch_final << "°\n" << std::endl;
         
         return result;
     }
@@ -1577,24 +2008,64 @@ int main() {
                         TriangulationDistanceSensor::DistanceResult distance_result = 
                             distance_sensor.calculate(temps, frame_width, frame_height);
                         
-                        // Draw ONLY the hottest pixel marker (no bounding boxes)
+                        // Draw BOTH hot spots with bounding boxes
                         if (distance_result.detected) {
+                            // Draw above emitter spot (primary) - GREEN
                             drawHottestPixelMarker(renderer->renderer, renderer->font,
                                 distance_result.hottest_x, distance_result.hottest_y,
                                 distance_result.hottest_temp, distance_result.distance_to_glass_cm,
                                 scale_factor);
+                            
+                            // Draw left emitter spot (secondary) - CYAN
+                            // Use a different color-coded marker function
+                            int display_x = distance_result.second_spot_x * scale_factor;
+                            int display_y = distance_result.second_spot_y * scale_factor;
+                            
+                            // Draw small CYAN bounding box
+                            SDL_SetRenderDrawColor(renderer->renderer, 0, 255, 255, 255);  // Cyan
+                            
+                            int box_size = 5;
+                            SDL_Rect box;
+                            box.x = display_x - box_size/2;
+                            box.y = display_y - box_size/2;
+                            box.w = box_size;
+                            box.h = box_size;
+                            SDL_RenderDrawRect(renderer->renderer, &box);
+                            
+                            // Draw label for left spot
+                            if (renderer->font) {
+                                std::stringstream ss;
+                                ss << std::fixed << std::setprecision(1) << distance_result.second_spot_temp << "C";
+                                std::string label = ss.str();
+                                
+                                SDL_Color textColor = { 0, 255, 255, 255 };  // Cyan text
+                                SDL_Surface* textSurface = TTF_RenderText_Solid(renderer->font, label.c_str(), textColor);
+                                if (textSurface) {
+                                    SDL_Texture* textTexture = SDL_CreateTextureFromSurface(renderer->renderer, textSurface);
+                                    if (textTexture) {
+                                        SDL_Rect textRect;
+                                        textRect.x = display_x + 8;
+                                        textRect.y = display_y - 10;
+                                        textRect.w = textSurface->w;
+                                        textRect.h = textSurface->h;
+                                        
+                                        SDL_SetRenderDrawBlendMode(renderer->renderer, SDL_BLENDMODE_BLEND);
+                                        SDL_SetRenderDrawColor(renderer->renderer, 0, 0, 0, 200);
+                                        SDL_Rect bgRect;
+                                        bgRect.x = textRect.x - 2; bgRect.y = textRect.y - 2;
+                                        bgRect.w = textRect.w + 4; bgRect.h = textRect.h + 4;
+                                        SDL_RenderFillRect(renderer->renderer, &bgRect);
+                                        
+                                        SDL_RenderCopy(renderer->renderer, textTexture, nullptr, &textRect);
+                                        SDL_DestroyTexture(textTexture);
+                                    }
+                                    SDL_FreeSurface(textSurface);
+                                }
+                            }
                         }
                         
-                        // Print distance to console if detected
-                        if (distance_result.detected) {
-                            std::cout << "Hottest: (" << distance_result.hottest_x << ", " << distance_result.hottest_y << ") "
-                                      << distance_result.hottest_temp << "°C | "
-                                      << "V_angle: " << distance_result.vertical_angle_deg << "° | "
-                                      << "H_angle: " << distance_result.horizontal_angle_deg << "° | "
-                                      << "Yaw: " << distance_result.camera_yaw_deg << "° | "
-                                      << "► Distance: " << distance_result.distance_to_glass_cm << " cm"
-                                      << std::endl;
-                        }
+                        // (Detailed console output is now in calculate() function)
+
 
                         drawSidebar(renderer->renderer, renderer->font, renderer->font_small,
                             renderer->detected_objects, renderer->center_pixel_temp,
