@@ -151,33 +151,48 @@ private:
     float VFOV_DEGREES;
     float focal_length_pixels;
     
-    // Temporal filtering
-    std::vector<float> distance_history;
-    std::vector<float> yaw_history;
-    std::vector<float> pitch_history;
-    const size_t FILTER_SIZE;
+    // Adaptive filter state (1-Euro inspired)
+    // Key insight: filter more when stationary, less when moving
+    float filtered_dist;
+    float filtered_yaw;
+    float filtered_pitch;
+    float filtered_spot1_x, filtered_spot1_y;
+    float filtered_spot2_x, filtered_spot2_y;
+    bool filter_initialized;
     
-    // EMA state
-    float ema_distance;
-    float ema_yaw;
-    float ema_pitch;
-    bool ema_init;
+    // Previous raw values for velocity estimation
+    float prev_dist;
+    float prev_yaw;
+    float prev_pitch;
+    float prev_spot1_x, prev_spot1_y;
+    float prev_spot2_x, prev_spot2_y;
     
-    // Deadband state
-    float last_dist;
-    float last_yaw;
-    float last_pitch;
+    // Median filter buffers
+    std::vector<float> dist_buffer;
+    std::vector<float> yaw_buffer;
+    std::vector<float> pitch_buffer;
+    std::vector<float> spot1_x_buffer;
+    std::vector<float> spot1_y_buffer;
+    std::vector<float> spot2_x_buffer;
+    std::vector<float> spot2_y_buffer;
+    static const size_t MEDIAN_WINDOW = 21;  // Large window = very stable median
     
-    float smoothValue(std::vector<float>& buffer, float new_val) {
+    float getMedian(std::vector<float>& buffer, float new_val) {
         buffer.push_back(new_val);
-        if (buffer.size() > FILTER_SIZE) {
+        if (buffer.size() > MEDIAN_WINDOW) {
             buffer.erase(buffer.begin());
         }
-        float sum = 0;
-        for (size_t i = 0; i < buffer.size(); i++) {
-            sum += buffer[i];
+        
+        // Copy and sort to find median
+        std::vector<float> sorted = buffer;
+        std::sort(sorted.begin(), sorted.end());
+        
+        size_t mid = sorted.size() / 2;
+        if (sorted.size() % 2 == 0) {
+            return (sorted[mid - 1] + sorted[mid]) / 2.0f;
+        } else {
+            return sorted[mid];
         }
-        return sum / buffer.size();
     }
     
     struct HotSpot {
@@ -193,30 +208,46 @@ private:
         spot.y = 0;
         spot.temp = 0;
         
-        float threshold = max_temp - 2.0f;
-        float sum_temp = 0.0f, sum_x = 0.0f, sum_y = 0.0f;
-        int count = 0;
+        // Use larger 7x7 window with gaussian spatial weighting for stability
+        // Gaussian weights (sigma ~= 1.5)
+        const float gauss[7][7] = {
+            {0.01f, 0.02f, 0.03f, 0.04f, 0.03f, 0.02f, 0.01f},
+            {0.02f, 0.04f, 0.06f, 0.07f, 0.06f, 0.04f, 0.02f},
+            {0.03f, 0.06f, 0.09f, 0.12f, 0.09f, 0.06f, 0.03f},
+            {0.04f, 0.07f, 0.12f, 0.15f, 0.12f, 0.07f, 0.04f},
+            {0.03f, 0.06f, 0.09f, 0.12f, 0.09f, 0.06f, 0.03f},
+            {0.02f, 0.04f, 0.06f, 0.07f, 0.06f, 0.04f, 0.02f},
+            {0.01f, 0.02f, 0.03f, 0.04f, 0.03f, 0.02f, 0.01f}
+        };
         
-        for (int dy = -2; dy <= 2; dy++) {
-            for (int dx = -2; dx <= 2; dx++) {
+        float threshold = max_temp - 3.0f;  // Wider threshold to include more pixels
+        float sum_weight = 0.0f, sum_x = 0.0f, sum_y = 0.0f;
+        
+        for (int dy = -3; dy <= 3; dy++) {
+            for (int dx = -3; dx <= 3; dx++) {
                 int px = center_x + dx;
                 int py = center_y + dy;
                 
                 if (px >= 0 && px < width && py >= 0 && py < height) {
                     float temp = temps[py * width + px];
                     if (temp > threshold) {
-                        sum_temp += temp;
-                        sum_x += temp * px;
-                        sum_y += temp * py;
-                        count++;
+                        // Combined weight: temperature^3 * gaussian spatial weight
+                        float temp_weight = (temp - threshold);
+                        temp_weight = temp_weight * temp_weight * temp_weight;  // Cubic for sharp peak
+                        float spatial_weight = gauss[dy + 3][dx + 3];
+                        float weight = temp_weight * spatial_weight;
+                        
+                        sum_weight += weight;
+                        sum_x += weight * px;
+                        sum_y += weight * py;
                     }
                 }
             }
         }
         
-        if (sum_temp > 0 && count >= 3) {
-            spot.x = sum_x / sum_temp;
-            spot.y = sum_y / sum_temp;
+        if (sum_weight > 0) {
+            spot.x = sum_x / sum_weight;
+            spot.y = sum_y / sum_weight;
             spot.temp = max_temp;
             spot.valid = true;
         } else {
@@ -230,13 +261,28 @@ private:
     }
     
 public:
-    TriangulationDistanceSensor() : FILTER_SIZE(8), ema_distance(0), ema_yaw(0), ema_pitch(0),
-                                     ema_init(false), last_dist(0), last_yaw(0), last_pitch(0) {
+    TriangulationDistanceSensor() : 
+        filtered_dist(0), filtered_yaw(0), filtered_pitch(0),
+        filtered_spot1_x(0), filtered_spot1_y(0),
+        filtered_spot2_x(0), filtered_spot2_y(0),
+        filter_initialized(false),
+        prev_dist(0), prev_yaw(0), prev_pitch(0),
+        prev_spot1_x(0), prev_spot1_y(0),
+        prev_spot2_x(0), prev_spot2_y(0) {
         float aspect_ratio = SENSOR_HEIGHT / SENSOR_WIDTH;
         float hfov_half_rad = (HFOV_DEGREES / 2.0f) * (float)M_PI / 180.0f;
         float vfov_half_rad = atan(tan(hfov_half_rad) * aspect_ratio);
         VFOV_DEGREES = (vfov_half_rad * 180.0f / (float)M_PI) * 2.0f;
         focal_length_pixels = (SENSOR_WIDTH / 2.0f) / tan(hfov_half_rad);
+        
+        // Reserve space for median buffers
+        dist_buffer.reserve(MEDIAN_WINDOW);
+        yaw_buffer.reserve(MEDIAN_WINDOW);
+        pitch_buffer.reserve(MEDIAN_WINDOW);
+        spot1_x_buffer.reserve(MEDIAN_WINDOW);
+        spot1_y_buffer.reserve(MEDIAN_WINDOW);
+        spot2_x_buffer.reserve(MEDIAN_WINDOW);
+        spot2_y_buffer.reserve(MEDIAN_WINDOW);
     }
     
     struct DistanceResult {
@@ -404,49 +450,110 @@ public:
         float d_separation = K_CALIBRATION / separation_pixels;
         
         // Account for reflection
-        float d_unified = d_separation / 2.0f;
+        float raw_dist = d_separation / 2.0f;
         
-        // Filtering
-        float d_ma = smoothValue(distance_history, d_unified);
-        float yaw_ma = smoothValue(yaw_history, camera_yaw_raw);
-        float pitch_ma = smoothValue(pitch_history, camera_pitch_raw);
+        // Raw spot positions (for display)
+        float raw_spot1_x = spot_above.x;
+        float raw_spot1_y = spot_above.y;
+        float raw_spot2_x = spot_left.x;
+        float raw_spot2_y = spot_left.y;
         
-        // Exponential smoothing
-        const float ALPHA = 0.5f;
+        // Apply simple smoothing only to final outputs
+        float final_dist, final_yaw, final_pitch;
+        float final_spot1_x, final_spot1_y, final_spot2_x, final_spot2_y;
         
-        if (!ema_init) {
-            ema_distance = d_ma;
-            ema_yaw = yaw_ma;
-            ema_pitch = pitch_ma;
-            ema_init = true;
+        if (!filter_initialized) {
+            // First frame - initialize
+            filtered_dist = raw_dist;
+            filtered_yaw = camera_yaw_raw;
+            filtered_pitch = camera_pitch_raw;
+            filtered_spot1_x = raw_spot1_x;
+            filtered_spot1_y = raw_spot1_y;
+            filtered_spot2_x = raw_spot2_x;
+            filtered_spot2_y = raw_spot2_y;
+            
+            prev_dist = raw_dist;
+            prev_yaw = camera_yaw_raw;
+            prev_pitch = camera_pitch_raw;
+            prev_spot1_x = raw_spot1_x;
+            prev_spot1_y = raw_spot1_y;
+            prev_spot2_x = raw_spot2_x;
+            prev_spot2_y = raw_spot2_y;
+            
+            filter_initialized = true;
+            
+            final_dist = raw_dist;
+            final_yaw = camera_yaw_raw;
+            final_pitch = camera_pitch_raw;
+            final_spot1_x = raw_spot1_x;
+            final_spot1_y = raw_spot1_y;
+            final_spot2_x = raw_spot2_x;
+            final_spot2_y = raw_spot2_y;
         } else {
-            ema_distance = ALPHA * d_ma + (1.0f - ALPHA) * ema_distance;
-            ema_yaw = ALPHA * yaw_ma + (1.0f - ALPHA) * ema_yaw;
-            ema_pitch = ALPHA * pitch_ma + (1.0f - ALPHA) * ema_pitch;
+            // Calculate speed of change for adaptive response
+            float dist_speed = fabs(raw_dist - prev_dist);
+            float yaw_speed = fabs(camera_yaw_raw - prev_yaw);
+            float pitch_speed = fabs(camera_pitch_raw - prev_pitch);
+            float spot1_speed = sqrt(pow(raw_spot1_x - prev_spot1_x, 2.0f) + pow(raw_spot1_y - prev_spot1_y, 2.0f));
+            float spot2_speed = sqrt(pow(raw_spot2_x - prev_spot2_x, 2.0f) + pow(raw_spot2_y - prev_spot2_y, 2.0f));
+            
+            // Update previous raw values BEFORE filtering (prevents drift)
+            prev_dist = raw_dist;
+            prev_yaw = camera_yaw_raw;
+            prev_pitch = camera_pitch_raw;
+            prev_spot1_x = raw_spot1_x;
+            prev_spot1_y = raw_spot1_y;
+            prev_spot2_x = raw_spot2_x;
+            prev_spot2_y = raw_spot2_y;
+            
+            // Adaptive alpha: low when still, high when moving
+            // Using squared speed for more aggressive noise rejection
+            float dist_alpha = std::min(0.01f + dist_speed * dist_speed * 2.0f, 0.5f);
+            float angle_alpha = std::min(0.01f + std::max(yaw_speed, pitch_speed) * std::max(yaw_speed, pitch_speed) * 1.0f, 0.5f);
+            float spot_alpha = std::min(0.01f + std::max(spot1_speed, spot2_speed) * std::max(spot1_speed, spot2_speed) * 0.5f, 0.5f);
+            
+            // Low-pass filter toward RAW values (not accumulated - prevents drift)
+            filtered_dist = dist_alpha * raw_dist + (1.0f - dist_alpha) * filtered_dist;
+            filtered_yaw = angle_alpha * camera_yaw_raw + (1.0f - angle_alpha) * filtered_yaw;
+            filtered_pitch = angle_alpha * camera_pitch_raw + (1.0f - angle_alpha) * filtered_pitch;
+            filtered_spot1_x = spot_alpha * raw_spot1_x + (1.0f - spot_alpha) * filtered_spot1_x;
+            filtered_spot1_y = spot_alpha * raw_spot1_y + (1.0f - spot_alpha) * filtered_spot1_y;
+            filtered_spot2_x = spot_alpha * raw_spot2_x + (1.0f - spot_alpha) * filtered_spot2_x;
+            filtered_spot2_y = spot_alpha * raw_spot2_y + (1.0f - spot_alpha) * filtered_spot2_y;
+            
+            // BIAS CORRECTION: Slowly pull filtered value toward long-term average of raw
+            // This prevents systematic drift in one direction
+            float raw_avg_dist = getMedian(dist_buffer, raw_dist);  // Use median as "true" value
+            float bias = filtered_dist - raw_avg_dist;
+            filtered_dist -= bias * 0.01f;  // Slowly correct bias
+            
+            float raw_avg_yaw = getMedian(yaw_buffer, camera_yaw_raw);
+            float yaw_bias = filtered_yaw - raw_avg_yaw;
+            filtered_yaw -= yaw_bias * 0.01f;
+            
+            float raw_avg_pitch = getMedian(pitch_buffer, camera_pitch_raw);
+            float pitch_bias = filtered_pitch - raw_avg_pitch;
+            filtered_pitch -= pitch_bias * 0.01f;
+            
+            final_dist = filtered_dist;
+            final_yaw = filtered_yaw;
+            final_pitch = filtered_pitch;
+            final_spot1_x = filtered_spot1_x;
+            final_spot1_y = filtered_spot1_y;
+            final_spot2_x = filtered_spot2_x;
+            final_spot2_y = filtered_spot2_y;
         }
-        
-        // Deadband
-        const float DEADBAND_DIST = 0.15f;
-        const float DEADBAND_ANGLE = 0.3f;
-        
-        float final_dist = (fabs(ema_distance - last_dist) > DEADBAND_DIST) ? ema_distance : last_dist;
-        float final_yaw = (fabs(ema_yaw - last_yaw) > DEADBAND_ANGLE) ? ema_yaw : last_yaw;
-        float final_pitch = (fabs(ema_pitch - last_pitch) > DEADBAND_ANGLE) ? ema_pitch : last_pitch;
-        
-        last_dist = final_dist;
-        last_yaw = final_yaw;
-        last_pitch = final_pitch;
         
         // Populate result
         result.detected = true;
         result.distance_cm = final_dist;
         result.camera_yaw_deg = final_yaw;
         result.camera_pitch_deg = final_pitch;
-        result.spot1_x = (int)round(spot_above.x);
-        result.spot1_y = (int)round(spot_above.y);
+        result.spot1_x = (int)round(final_spot1_x);
+        result.spot1_y = (int)round(final_spot1_y);
         result.spot1_temp = spot_above.temp;
-        result.spot2_x = (int)round(spot_left.x);
-        result.spot2_y = (int)round(spot_left.y);
+        result.spot2_x = (int)round(final_spot2_x);
+        result.spot2_y = (int)round(final_spot2_y);
         result.spot2_temp = spot_left.temp;
         
         return result;
