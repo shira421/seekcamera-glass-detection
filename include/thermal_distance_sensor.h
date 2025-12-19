@@ -8,7 +8,7 @@
  * in the thermal image. The pixel separation between spots is inversely
  * proportional to distance.
  * 
- * @author EE2026
+ * @author shira421
  * @version 1.0.0
  * @date 2024
  * 
@@ -38,20 +38,11 @@
 #endif
 
 namespace thermal {
-
-//=============================================================================
-// CONFIGURATION CONSTANTS
-//=============================================================================
-
 /** @brief Top percentage of temperatures shown in isolation mode */
 constexpr float ISOLATION_THRESHOLD = 0.15f;
 
 /** @brief Width of the UI sidebar in pixels */
 constexpr int SIDEBAR_WIDTH = 280;
-
-//=============================================================================
-// DATA STRUCTURES
-//=============================================================================
 
 /**
  * @brief Represents a detected thermal region in the image
@@ -92,10 +83,6 @@ struct SignatureScore {
     float circularity;          ///< Roundness score (0-1)
     float overall_score;        ///< Weighted combined score (0-1)
 };
-
-//=============================================================================
-// TRIANGULATION DISTANCE SENSOR CLASS
-//=============================================================================
 
 /**
  * @brief Main class for thermal triangulation distance measurement
@@ -165,10 +152,6 @@ public:
     DistanceResult calculate(float* temps, int width, int height);
 
 private:
-    //-------------------------------------------------------------------------
-    // Physical Setup Constants
-    //-------------------------------------------------------------------------
-    
     /** @brief Vertical offset of ABOVE emitter from camera (cm) */
     static constexpr float BASELINE_ABOVE_CM = 2.5f;
     
@@ -187,16 +170,8 @@ private:
     /** @brief Calibration constant: pixels × cm at reference distance */
     static constexpr float K_CALIBRATION = 1335.0f;
     
-    //-------------------------------------------------------------------------
-    // Derived Values (calculated in constructor)
-    //-------------------------------------------------------------------------
-    
     float vfov_degrees_;        ///< Vertical FOV calculated from HFOV
     float focal_length_pixels_; ///< Focal length in pixel units
-    
-    //-------------------------------------------------------------------------
-    // Filter State
-    //-------------------------------------------------------------------------
     
     float filtered_dist_, filtered_yaw_, filtered_pitch_;
     float filtered_spot1_x_, filtered_spot1_y_;
@@ -207,18 +182,10 @@ private:
     float prev_spot1_x_, prev_spot1_y_;
     float prev_spot2_x_, prev_spot2_y_;
     
-    //-------------------------------------------------------------------------
-    // Median Filter Buffers (for bias correction)
-    //-------------------------------------------------------------------------
-    
     std::vector<float> dist_buffer_;
     std::vector<float> yaw_buffer_;
     std::vector<float> pitch_buffer_;
     static constexpr size_t MEDIAN_WINDOW = 21;
-    
-    //-------------------------------------------------------------------------
-    // Private Helper Structures
-    //-------------------------------------------------------------------------
     
     /** @brief Internal representation of a detected hot spot */
     struct HotSpot {
@@ -226,10 +193,6 @@ private:
         float temp;     ///< Peak temperature
         bool valid;     ///< Whether detection was successful
     };
-    
-    //-------------------------------------------------------------------------
-    // Private Methods
-    //-------------------------------------------------------------------------
     
     /**
      * @brief Calculate median of buffer with new value added
@@ -256,10 +219,6 @@ private:
     HotSpot findHotSpotCentroid(float* temps, int width, int height,
                                  int center_x, int center_y, float max_temp);
 };
-
-//=============================================================================
-// UTILITY FUNCTIONS
-//=============================================================================
 
 /**
  * @brief Convert temperature to display color

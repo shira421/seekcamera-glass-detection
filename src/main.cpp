@@ -40,10 +40,6 @@
 
 using namespace thermal;
 
-//=============================================================================
-// RENDERER STATE STRUCTURE
-//=============================================================================
-
 /**
  * @brief Per-camera renderer state
  */
@@ -81,19 +77,11 @@ struct seekrenderer_t {
     }
 };
 
-//=============================================================================
-// GLOBAL STATE
-//=============================================================================
-
 static std::atomic<bool> g_exit_requested;
 static std::map<std::string, seekrenderer_t*> g_renderers;
 static std::mutex g_mutex;
 static std::condition_variable g_condition_variable;
 static std::atomic<bool> g_is_dirty;
-
-//=============================================================================
-// CAMERA CALLBACKS
-//=============================================================================
 
 /**
  * @brief Called when a new frame is available from the camera
@@ -214,10 +202,6 @@ void camera_event_callback(seekcamera_t* camera,
     }
 }
 
-//=============================================================================
-// CLEANUP
-//=============================================================================
-
 /**
  * @brief Clean up renderer resources
  */
@@ -259,10 +243,6 @@ static void signal_callback(int signum) {
     g_exit_requested.store(true);
 }
 
-//=============================================================================
-// MAIN FUNCTION
-//=============================================================================
-
 int main() {
     g_exit_requested.store(false);
     g_is_dirty.store(false);
@@ -293,10 +273,6 @@ int main() {
     // Terminal output rate limiting
     std::chrono::steady_clock::time_point last_print = std::chrono::steady_clock::now();
     const std::chrono::milliseconds print_interval(200);
-
-    //-------------------------------------------------------------------------
-    // Main render loop
-    //-------------------------------------------------------------------------
     
     while (!g_exit_requested.load()) {
         std::unique_lock<std::mutex> lock(g_mutex);
@@ -476,10 +452,6 @@ int main() {
             }
         }
     }
-
-    //-------------------------------------------------------------------------
-    // Cleanup
-    //-------------------------------------------------------------------------
     
     std::cout << std::endl << "Shutting down..." << std::endl;
 

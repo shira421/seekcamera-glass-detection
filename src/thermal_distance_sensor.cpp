@@ -10,10 +10,6 @@
 
 namespace thermal {
 
-//=============================================================================
-// TRIANGULATION DISTANCE SENSOR IMPLEMENTATION
-//=============================================================================
-
 TriangulationDistanceSensor::TriangulationDistanceSensor()
     : filtered_dist_(0), filtered_yaw_(0), filtered_pitch_(0)
     , filtered_spot1_x_(0), filtered_spot1_y_(0)
@@ -138,10 +134,6 @@ DistanceResult TriangulationDistanceSensor::calculate(
     result.spot1_temp = 0;
     result.spot2_temp = 0;
     
-    //-------------------------------------------------------------------------
-    // Step 1: Calculate background statistics and detection threshold
-    //-------------------------------------------------------------------------
-    
     std::vector<float> all_temps;
     all_temps.reserve(width * height);
     for (int y = 0; y < height; y++) {
@@ -158,10 +150,6 @@ DistanceResult TriangulationDistanceSensor::calculate(
     constexpr float MIN_TEMP_ABOVE_BG = 0.1f;
     constexpr int NEIGHBORHOOD = 2;  // 5x5 window for local max detection
     float detection_threshold = std::min(background_temp + MIN_TEMP_ABOVE_BG, temp_80th);
-    
-    //-------------------------------------------------------------------------
-    // Step 2: Find local maxima (candidate hot spots)
-    //-------------------------------------------------------------------------
     
     struct LocalMax {
         int x, y;
@@ -212,10 +200,6 @@ DistanceResult TriangulationDistanceSensor::calculate(
         return result;  // Need at least 2 spots
     }
     
-    //-------------------------------------------------------------------------
-    // Step 3: Select two spots with sufficient separation
-    //-------------------------------------------------------------------------
-    
     constexpr float MIN_SEPARATION = 10.0f;  // Minimum pixel separation
     LocalMax spot1 = local_maxima[0];  // Hottest spot
     LocalMax spot2;
@@ -235,20 +219,12 @@ DistanceResult TriangulationDistanceSensor::calculate(
     
     if (!found_second) return result;
     
-    //-------------------------------------------------------------------------
-    // Step 4: Get sub-pixel centroids
-    //-------------------------------------------------------------------------
-    
     HotSpot hotspot1 = findHotSpotCentroid(temps, width, height, 
                                            spot1.x, spot1.y, spot1.temp);
     HotSpot hotspot2 = findHotSpotCentroid(temps, width, height, 
                                            spot2.x, spot2.y, spot2.temp);
     
     if (!hotspot1.valid || !hotspot2.valid) return result;
-    
-    //-------------------------------------------------------------------------
-    // Step 5: Identify which spot is ABOVE vs LEFT emitter
-    //-------------------------------------------------------------------------
     
     HotSpot spot_above, spot_left;
     float dx = hotspot2.x - hotspot1.x;
@@ -274,10 +250,6 @@ DistanceResult TriangulationDistanceSensor::calculate(
         }
     }
     
-    //-------------------------------------------------------------------------
-    // Step 6: Calculate camera angles
-    //-------------------------------------------------------------------------
-    
     constexpr float center_x = 160.0f;
     constexpr float center_y = 120.0f;
     
@@ -297,10 +269,6 @@ DistanceResult TriangulationDistanceSensor::calculate(
     float camera_yaw_raw = -spot_yaw_deg;
     float camera_pitch_raw = spot_pitch_deg;
     
-    //-------------------------------------------------------------------------
-    // Step 7: Calculate distance from pixel separation
-    //-------------------------------------------------------------------------
-    
     float dx_pixels = spot_above.x - spot_left.x;
     float dy_pixels = spot_above.y - spot_left.y;
     float separation_pixels = std::sqrt(dx_pixels * dx_pixels + dy_pixels * dy_pixels);
@@ -316,10 +284,6 @@ DistanceResult TriangulationDistanceSensor::calculate(
     float raw_spot1_y = spot_above.y;
     float raw_spot2_x = spot_left.x;
     float raw_spot2_y = spot_left.y;
-    
-    //-------------------------------------------------------------------------
-    // Step 8: Apply temporal filtering with bias correction
-    //-------------------------------------------------------------------------
     
     float final_dist, final_yaw, final_pitch;
     float final_spot1_x, final_spot1_y, final_spot2_x, final_spot2_y;
@@ -414,10 +378,6 @@ DistanceResult TriangulationDistanceSensor::calculate(
         final_spot2_y = filtered_spot2_y_;
     }
     
-    //-------------------------------------------------------------------------
-    // Step 9: Populate and return result
-    //-------------------------------------------------------------------------
-    
     result.detected = true;
     result.distance_cm = final_dist;
     result.camera_yaw_deg = final_yaw;
@@ -431,10 +391,6 @@ DistanceResult TriangulationDistanceSensor::calculate(
     
     return result;
 }
-
-//=============================================================================
-// COLOR MAPPING
-//=============================================================================
 
 SDL_Color mapTemperature(float temp, float min_temp, float max_temp, 
                          bool isolation_mode) {
@@ -493,10 +449,6 @@ SDL_Color mapTemperature(float temp, float min_temp, float max_temp,
     return color;
 }
 
-//=============================================================================
-// CONNECTED COMPONENTS
-//=============================================================================
-
 std::vector<std::vector<int>> findConnectedComponents(
     std::vector<std::vector<bool>>& binary_map, int width, int height)
 {
@@ -538,10 +490,6 @@ std::vector<std::vector<int>> findConnectedComponents(
     }
     return labels;
 }
-
-//=============================================================================
-// SIGNATURE PATTERN ANALYSIS
-//=============================================================================
 
 SignatureScore analyzeSignaturePattern(float* temps, int width, int height,
                                        const ThermalObject& obj) {
@@ -652,10 +600,6 @@ SignatureScore analyzeSignaturePattern(float* temps, int width, int height,
     
     return score;
 }
-
-//=============================================================================
-// THERMAL OBJECT DETECTION
-//=============================================================================
 
 std::vector<ThermalObject> detectThermalObjects(float* temps, int width, 
                                                  int height, int& next_id) {

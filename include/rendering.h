@@ -21,10 +21,6 @@
 
 namespace thermal {
 
-//=============================================================================
-// TEXT RENDERING
-//=============================================================================
-
 /**
  * @brief Render text to the screen
  * 
@@ -37,10 +33,6 @@ namespace thermal {
  */
 void renderText(SDL_Renderer* renderer, TTF_Font* font, const char* text,
                 int x, int y, SDL_Color color);
-
-//=============================================================================
-// OVERLAY DRAWING
-//=============================================================================
 
 /**
  * @brief Draw center crosshair on thermal image
@@ -89,10 +81,6 @@ void drawSpotMarker(SDL_Renderer* renderer, TTF_Font* font,
 void drawCameraMarker(SDL_Renderer* renderer, TTF_Font* font,
                       int spot1_x, int spot1_y, int spot2_x, int spot2_y,
                       int scale);
-
-//=============================================================================
-// SIDEBAR UI
-//=============================================================================
 
 /**
  * @brief Draw the sidebar UI panel

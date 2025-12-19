@@ -9,10 +9,6 @@
 
 namespace thermal {
 
-//=============================================================================
-// TEXT RENDERING
-//=============================================================================
-
 void renderText(SDL_Renderer* renderer, TTF_Font* font, const char* text,
                 int x, int y, SDL_Color color) {
     SDL_Surface* surface = TTF_RenderText_Blended(font, text, color);
@@ -30,10 +26,6 @@ void renderText(SDL_Renderer* renderer, TTF_Font* font, const char* text,
         SDL_FreeSurface(surface);
     }
 }
-
-//=============================================================================
-// OVERLAY DRAWING
-//=============================================================================
 
 void drawCrosshair(SDL_Renderer* renderer, int width, int height) {
     int cx = width / 2;
@@ -105,10 +97,6 @@ void drawCameraMarker(SDL_Renderer* renderer, TTF_Font* font,
     center_dot.h = 4;
     SDL_RenderFillRect(renderer, &center_dot);
 }
-
-//=============================================================================
-// SIDEBAR UI
-//=============================================================================
 
 void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_large,
                  bool detected, float distance_cm, 
