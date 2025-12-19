@@ -10,7 +10,7 @@ A triangulation system for measuring distance and angles to thermally reflective
 
 This project implements a non-contact distance and angle measurement system using a thermal camera and multiple heat emitters positioned at known offsets. The system detects glass surfaces by leveraging the unique thermal properties of glass - it's opaque to longwave IR, causing heat signatures to reflect rather than pass through.
 
-![alt text](<Screenshot 2025-12-19 120422-1.png>)
+![UI Screenshot](assets/screenshot-ui.png)
 
 https://github.com/user-attachments/assets/a59d74d8-4792-49ac-be6e-955b5a7c6dcb
 
@@ -185,7 +185,7 @@ The system uses adaptive low-pass filtering with bias correction:
 ## Performance
 S314SPX Mosaic Core Starter Kit 320x240, 57HFOV, FF
 
-![alt text](<Screenshot 2025-12-19 120718.png>)
+![Performance Screenshot](assets/screenshot-performance.png)
 
 | Metric | Value |
 |--------|-------|
