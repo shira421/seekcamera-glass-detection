@@ -1,6 +1,6 @@
 # Thermal Distance Sensor
 
-A triangulation system for measuring distance to thermally reflective glass surfaces using thermal imaging and heat emitters.
+A triangulation system for measuring distance and angles to thermally reflective glass surfaces using thermal imaging and heat emitters.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![C++](https://img.shields.io/badge/C%2B%2B-11%2F14-blue.svg)
@@ -8,9 +8,11 @@ A triangulation system for measuring distance to thermally reflective glass surf
 
 ## Overview
 
-This project implements a non-contact distance measurement system using a thermal camera and multiple heat emitters positioned at known offsets. The system detects glass surfaces by leveraging the unique thermal properties of glass - it's opaque to longwave IR, causing heat signatures to reflect rather than pass through.
+This project implements a non-contact distance and angle measurement system using a thermal camera and multiple heat emitters positioned at known offsets. The system detects glass surfaces by leveraging the unique thermal properties of glass - it's opaque to longwave IR, causing heat signatures to reflect rather than pass through.
 
 ![alt text](<Screenshot 2025-12-19 120422-1.png>)
+
+https://github.com/user-attachments/assets/a59d74d8-4792-49ac-be6e-955b5a7c6dcb
 
 ### Key Features
 
