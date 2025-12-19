@@ -1,226 +1,223 @@
-# Seekcamera Glass Detector
+# Thermal Distance Sensor
 
-A thermal imaging application for detecting glass using Seek Thermal cameras and a heat source. Leverages the reflective properties of glass in thermal imaging—detecting glass surfaces by identifying reflected heat sources.
+A triangulation system for measuring distance to thermally reflective glass surfaces using thermal imaging and heat emitters.
 
-## Features
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![C++](https://img.shields.io/badge/C%2B%2B-11%2F14-blue.svg)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)
 
-- **Real-time Thermal Imaging** - Live feed from Seek Thermal cameras
-- **Histogram Equalization (CLAHE)** - Professional-grade contrast enhancement with vibrant color gradients
-- **Dynamic Temperature Detection** - Adjustable threshold (20-100°C) with interactive slider
-- **Bounding Box Visualization** - Color-coded boxes from yellow (warm) to red (hot)
-- **Interactive Crosshair** - Real-time temperature readout at cursor position
-- **Multiple Object Tracking** - Detects and labels multiple hot objects simultaneously
-- **Compact Sidebar UI** - Shows detection summary, center pixel info, and targeted object details
+## Overview
 
-## Building
+This project implements a non-contact distance measurement system using a thermal camera and multiple heat emitters positioned at known offsets. The system detects glass surfaces by leveraging the unique thermal properties of glass - it's opaque to longwave IR, causing heat signatures to reflect rather than pass through.
 
-### Prerequisites
+![alt text](<Screenshot 2025-12-19 120422-1.png>)
 
-- **CMake** 3.15 or higher
-- **Visual Studio 2019/2022** (Windows) or **GCC/Clang** (Linux/macOS)
-- **Seek Thermal SDK** 4.4.2 or higher
-- **SDL2** 2.0.0 or higher
-- **SDL2_ttf** 2.0.0 or higher
+### Key Features
 
-### Windows Build
+- **Real-time distance measurement** to reflective surfaces (glass)
+- **Camera orientation tracking** (yaw and pitch angles)
+- **Sub-pixel accuracy** using Gaussian-weighted centroid detection
+- **Adaptive filtering** with bias correction for stable readings
+- **Visual UI** with thermal image display and measurement overlay
 
-1. **Install dependencies:**
-   - Download [Seek Thermal SDK](https://www.thermal.com/developer-center.html)
-   - Download [SDL2 Development Libraries](https://github.com/libsdl-org/SDL/releases)
-   - Download [SDL2_ttf Development Libraries](https://github.com/libsdl-org/SDL_ttf/releases)
+## How It Works
 
-2. **Update paths in CMakeLists.txt:**
-   ```cmake
-   set(SEEKCAMERA_SDK_DIR "C:/path/to/Seek_Thermal_SDK_4.4.2.20/x64-windows")
-   set(SDL2_DIR "C:/SDL2-2.32.10")
-   set(SDL2_TTF_DIR "C:/SDL2_ttf-2.24.0")
-   ```
+### Physical Principle
 
-3. **Build:**
-   ```bash
-   mkdir build
-   cd build
-   cmake ..
-   cmake --build . --config Release
-   ```
+Glass is opaque to longwave infrared (LWIR) radiation, which means thermal cameras see glass as a mirror. When heat emitters are positioned near the camera, their reflections appear as hot spots in the thermal image.
 
-4. **Run:**
-   ```bash
-   cd Release
-   ./seekcamera-glass-detector.exe
-   ```
-
-### Linux Build
-
-```bash
-# Install dependencies
-sudo apt-get install libsdl2-dev libsdl2-ttf-dev
-
-# Build
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-
-# Run
-./seekcamera-glass-detector
-```
-
-## Usage
-
-Connect your Seek Thermal camera and run:
-
-```bash
-./seekcamera-glass-detector
-```
-
-### Expected Output
-
-```txt
-seekcamera-glass-detector starting
-Detected 1 Seek Thermal camera(s)
-Using CLAHE histogram equalization
-Temperature threshold: 40.0°C
-
-User controls:
-  1) Mouse: Point at objects to inspect temperature
-  2) Slider: Adjust detection temperature threshold (20-100°C)
-  3) Mouse Click: Cycle through color palettes
-  4) Q: Quit application
-```
-
-## User Controls
-
-### Temperature Threshold Adjustment
-- **Drag the slider** in the sidebar to adjust the detection threshold (20-100°C)
-- Objects above the threshold will be highlighted with bounding boxes
-- Green crosshair appears when pointing at temperatures ≥ threshold
-
-### Interactive Inspection
-- **Move mouse cursor** over the thermal image to read temperature at any point
-- Crosshair turns **green** when temperature ≥ threshold
-- Sidebar shows real-time temperature and color indicator
-
-### Quit
-- Press **Q** to exit the application
-
-## Display Layout
+Current implementation uses two heat emitters - one above and one on the left.
 
 ```
-┌─────────────────────────────────────┬──────────────────┐
-│                                     │  Temperature     │
-│                                     │  Threshold:      │
-│        Thermal Image                │  [═══○═════]     │
-│      (with bounding boxes)          │   40.0 C         │
-│                                     │                  │
-│                                     │  Center Pixel:   │
-│                                     │  32.5 C          │
-│                                     │  [████████]      │
-│                                     │                  │
-│                                     │  Targeted:       │
-│  41.9 C                             │  42.3 C          │
-│  ┌─────────────────┐                │                  │
-│  │                 │                │                  │
-│  │    Hot Object   │                │  Detected: 3     │
-│  │                 │                │  Avg: 42.1 C     │
-│  └─────────────────┘                │  Max: 45.3 C     │
-│                                     │                  │
-└─────────────────────────────────────┴──────────────────┘
+                    GLASS SURFACE
+                         │
+    [ABOVE EMITTER]      │      reflection of ABOVE
+           │             │            │
+           │ 2.5cm       │            │
+           │             │            │
+    [CAMERA]─────────────┼────────────●  ← visible hot spot
+           │             │            │
+           │             │            │
+    [LEFT EMITTER]───────┼────────────●  ← visible hot spot
+         3.3cm           │
+                         │
 ```
 
-<img width="1402" height="757" alt="image" src="https://github.com/user-attachments/assets/0781e4b1-5f1d-498e-97ef-9822b9b70f2a" />
+### Distance Calculation
 
+The pixel separation between the two reflected hot spots is inversely proportional to distance:
 
-## Algorithm Details
-
-### CLAHE Histogram Equalization
-The application uses **Contrast Limited Adaptive Histogram Equalization** (CLAHE) for professional thermal imaging:
-
-1. **Histogram Generation** - 256-bin temperature distribution
-2. **Plateau Clipping** - Limits contrast at 2.5× average to prevent noise amplification
-3. **Pixel Redistribution** - Spreads clipped pixels evenly across bins
-4. **CDF Mapping** - Maps temperatures through cumulative distribution function
-5. **Result** - Dramatic color separation matching professional thermal cameras
-
-### Object Detection
-Connected component analysis with these parameters:
-- **Minimum object size**: 15 pixels
-- **Temperature threshold**: User-adjustable (20-100°C)
-- **Bounding box colors**: Yellow → Orange → Red based on relative temperature
-
-## Configuration
-
-Edit these constants in `src/seekcamera-glass-detector.cpp`:
-
-```cpp
-const int MIN_OBJECT_SIZE = 15;        // Minimum pixels for detection
-const int SIDEBAR_WIDTH = 300;         // Sidebar width in pixels
-const float PLATEAU_LIMIT = 2.5f;      // CLAHE contrast clipping threshold
 ```
+distance = K / (pixel_separation × 2)
+```
+
+Where:
+- `K` = calibration constant (1335 pixels×cm for this setup)
+- `pixel_separation` = Euclidean distance between spots in pixels
+
+### Angle Calculation
+
+Camera orientation is determined by the position of hot spots relative to the image center:
+
+```
+yaw = -(spot_x - center_x) / 160 × 28°    # Horizontal angle
+pitch = (spot_y - center_y) / 120 × 22°   # Vertical angle
+```
+
+## Hardware Requirements
+
+| Component | Specification |
+|-----------|--------------|
+| Thermal Camera | Seek Thermal SD314SPX Drone Core |
+| Resolution | 320 × 240 pixels |
+| Field of View | 56° horizontal, ~44° vertical |
+| Heat Emitters | 2× positioned at known offsets |
+| Emitter Position | 2.5cm above, 3.3cm left of camera |
+
+## Software Dependencies
+
+- **Seek Thermal SDK** - Camera interface
+- **SDL2** - Window management and rendering
+- **SDL2_ttf** - Font rendering
+- **C++11** or later
 
 ## Project Structure
 
 ```
-seekcamera-glass-detector/
-├── CMakeLists.txt                    # Build configuration
-├── README.md                         # This file
-├── .gitignore                        # Git ignore rules
+thermal_distance_sensor/
+├── CMakeLists.txt              # Build configuration
+├── README.md                   # This file
+├── include/
+│   ├── thermal_distance_sensor.h   # Core algorithm header
+│   └── rendering.h             # UI rendering header
 ├── src/
-│   └── seekcamera-glass-detector.cpp # Main application
-└── build/                            # Build output (not in git)
-    ├── Debug/
-    └── Release/
-        ├── seekcamera-glass-detector.exe
-        ├── seekcamera.dll
-        ├── SDL2.dll
-        └── SDL2_ttf.dll
+│   ├── main.cpp                # Application entry point
+│   ├── thermal_distance_sensor.cpp # Algorithm implementation
+│   └── rendering.cpp           # UI implementation
+└── docs/
+    └── algorithm.md            # Detailed algorithm documentation
 ```
 
-## Development
+## Building
 
-### Quick Rebuild After Code Changes
-```bash
-cmake --build build --config Release
-```
+### Linux
 
-### Switch Between Versions
 ```bash
-# Use different source file
-cp thermal-tracker-v2.cpp src/seekcamera-glass-detector.cpp
-cmake --build build --config Release
-```
-
-### Clean Build
-```bash
-rm -rf build
 mkdir build && cd build
 cmake ..
+make
+```
+
+### Windows (with vcpkg)
+
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_TOOLCHAIN_FILE=[vcpkg root]/scripts/buildsystems/vcpkg.cmake
 cmake --build . --config Release
 ```
 
-## Technical Specifications
+### Build Options
 
-<img width="1050" height="590" alt="image" src="https://github.com/user-attachments/assets/8a37b9be-d667-4fbb-92a5-d4c4ee83f7db" />
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SEEKCAMERA_INCLUDE_DIR` | `/usr/include` | Seek SDK include path |
+| `SEEKCAMERA_LIB_DIR` | `/usr/lib` | Seek SDK library path |
 
-- **Frame Rate**: ~30 FPS on 320×240 thermal sensor
-- **Temperature Range**: Depends on camera model (typically -40°C to 330°C)
-- **Temperature Accuracy**: ±3°C or ±5% (camera-dependent)
-- **Display Resolution**: Native sensor resolution (typically 320×240)
-- **Supported Cameras**: All Seek Thermal USB cameras (Compact, CompactPRO, etc.)
+## Usage
 
-## Credits
+### Running
 
-- **Seek Thermal SDK** - Thermal imaging interface
-- **SDL2** - Graphics rendering
-- **SDL2_ttf** - Text rendering
-- **CLAHE Algorithm** - Based on thermal imaging industry standards
+```bash
+./thermal_distance_sensor
+```
+
+### Controls
+
+| Key | Action |
+|-----|--------|
+| `I` | Toggle isolation mode (show only top 15% temps) |
+| `Q` | Quit application |
+
+### Display
+
+The application shows:
+
+1. **Thermal Image** - Color-mapped temperature display
+2. **Spot Markers** - Green (ABOVE) and Cyan (LEFT) boxes on detected spots
+3. **Camera Marker** - Red dot showing where camera is pointing
+4. **Sidebar UI**:
+   - Distance measurement (large display)
+   - Spot temperatures
+   - Camera orientation (yaw/pitch)
+   - Visual tilt indicator
+   - Mode status
+
+## Algorithm Details
+
+### Hot Spot Detection
+
+1. **Local Maxima Finding** - Scan for pixels that are hotter than their 5×5 neighborhood
+2. **Sub-pixel Centroid** - Use 7×7 Gaussian-weighted averaging for precise position:
+   ```
+   weight = (temp - threshold)³ × gaussian_spatial_weight
+   centroid = Σ(weight × position) / Σ(weight)
+   ```
+3. **Spot Identification** - Determine which spot is ABOVE vs LEFT based on relative position
+### Filtering
+
+The system uses adaptive low-pass filtering with bias correction:
+
+1. **Adaptive Alpha** - Smoothing strength based on rate of change:
+   ```
+   alpha = min(0.01 + speed² × 2.0, 0.5)
+   ```
+   - Still: alpha ≈ 0.01 (heavy smoothing)
+   - Moving: alpha → 0.5 (responsive)
+
+2. **Bias Correction** - Prevents drift by slowly pulling toward median:
+   ```
+   bias = filtered - median(recent_raw_values)
+   filtered -= bias × 0.01
+   ```
+
+## Performance
+S314SPX Mosaic Core Starter Kit 320x240, 57HFOV, FF
+
+![alt text](<Screenshot 2025-12-19 120718.png>)
+
+| Metric | Value |
+|--------|-------|
+| Frame Rate | ~27 Hz (camera limited) |
+| Latency | <100ms typical |
+| Distance Range | 10-100+ cm (depending on emitter power) |
+| Angular Range | ±28° yaw, ±22° pitch |
+
+## Troubleshooting
+
+### No spots detected
+
+- Ensure emitters are powered and producing heat
+- Check that glass surface is in view
+- Try disabling isolation mode (press `I`)
+- Verify emitters are within temperature threshold
+
+### Unstable readings
+
+- Ensure camera and emitters are rigidly mounted
+- Allow system to warm up (~30 seconds)
+- Check for interfering heat sources
+
+### Camera not found
+
+- Verify Seek Thermal SDK is installed
+- Check USB connection
+- Ensure proper permissions (Linux: add user to `plugdev` group)
 
 ## License
 
-This project uses the Seek Thermal SDK. Please refer to Seek Thermal's licensing terms for SDK usage.
+MIT License - See LICENSE file for details.
 
-## Support
+## Acknowledgments
 
-For issues related to:
-- **Seek SDK**: Visit [Seek Thermal Developer Center](https://www.thermal.com/developer-center.html)
-- **This Application**: Open an issue on GitHub
-- **Camera Hardware**: Contact Seek Thermal support
+- Seek Thermal for the camera SDK
+- SDL2 development team
