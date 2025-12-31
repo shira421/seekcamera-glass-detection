@@ -1,4 +1,4 @@
-# PCB Grid Thermal Distance Sensor
+# Glass Ranging System using SeekThermal Cameras
 
 A thermal imaging system for measuring distance and orientation to glass surfaces using a custom heat emitter grid and computer vision algorithms.
 
