@@ -1,6 +1,6 @@
-# Thermal Distance Sensor
+# PCB Grid Thermal Distance Sensor
 
-A triangulation system for measuring distance and angles to thermally reflective glass surfaces using thermal imaging and heat emitters.
+A thermal imaging system for measuring distance and orientation to glass surfaces using a custom heat emitter grid and computer vision algorithms.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![C++](https://img.shields.io/badge/C%2B%2B-11%2F14-blue.svg)
@@ -8,97 +8,91 @@ A triangulation system for measuring distance and angles to thermally reflective
 
 ## Overview
 
-This project implements a non-contact distance and angle measurement system using a thermal camera and multiple heat emitters positioned at known offsets. The system detects glass surfaces by leveraging the unique thermal properties of glass - it's opaque to longwave IR, causing heat signatures to reflect rather than pass through.
+This system measures distance to glass surfaces by detecting the thermal reflection of a known emitter pattern. Glass is opaque to longwave infrared radiation, causing the heat signature to be reflected. By analyzing the apparent size and position of the reflected pattern, the system calculates distance and camera orientation in real-time.
 
 ![UI Screenshot](assets/screenshot-ui.png)
 
-https://github.com/user-attachments/assets/a59d74d8-4792-49ac-be6e-955b5a7c6dcb
-
 ### Key Features
 
-- **Real-time distance measurement** to reflective surfaces (glass)
-- **Camera orientation tracking** (yaw and pitch angles)
-- **Sub-pixel accuracy** using Gaussian-weighted centroid detection
-- **Adaptive filtering** with bias correction for stable readings
-- **Visual UI** with thermal image display and measurement overlay
+- **Real-time distance measurement** using blob-based scale estimation
+- **Camera orientation tracking** (yaw and pitch angles) from reflection position
+- **Temporal persistence** - maintains tracking through brief detection dropouts
+- **Adaptive filtering** with velocity-aware smoothing for stable, responsive readings
+- **Scaled hot spot detection** - works reliably from close range to far distances
+- **Visual UI** with thermal image display, detection overlays, and measurement sidebar
 
 ## How It Works
 
 ### Physical Principle
 
-Glass is opaque to longwave infrared (LWIR) radiation, which means thermal cameras see glass as a mirror. When heat emitters are positioned near the camera, their reflections appear as hot spots in the thermal image.
-
-Current implementation uses two heat emitters - one above and one on the left.
+Glass is opaque to longwave infrared (LWIR) radiation, so thermal cameras see glass as a mirror. A PCB with a grid of heat emitters is mounted around the camera. When pointed at glass, the emitters' reflections appear as a pattern of hot spots.
 
 ```
-                    GLASS SURFACE
-                         │
-    [ABOVE EMITTER]      │      reflection of ABOVE
-           │             │            │
-           │ 2.5cm       │            │
-           │             │            │
-    [CAMERA]─────────────┼────────────●  ← visible hot spot
-           │             │            │
-           │             │            │
-    [LEFT EMITTER]───────┼────────────●  ← visible hot spot
-         3.3cm           │
-                         │
+                         GLASS SURFACE
+                              │
+    ┌─────────────────────┐   │   ┌─────────────────────┐
+    │ ● ● ● ● ● ● ● ● ● ● │   │   │ ● ● ● ● ● ● ● ● ● ● │
+    │ ● ● ● ●     ● ● ● ● │   │   │ ● ● ● ●     ● ● ● ● │
+    │ ● ● ● ● ● ● ● ● ● ● │◄──┼──►│ ● ● ● ● ● ● ● ● ● ● │
+    │     ◆           ◆   │   │   │     ◆           ◆   │
+    └─────────────────────┘   │   └─────────────────────┘
+           PCB                │         Reflection
+        (with camera          │      (seen by camera)
+         in center)           │
 ```
+
+### PCB Layout
+
+The custom PCB features a 45-emitter grid pattern:
+
+| Component | Specification |
+|-----------|---------------|
+| Main Grid | 3 rows × 13 columns (35 emitters) |
+| Camera Hole | Center of row 1, columns 5-7 missing |
+| Anchor Points | 2 diamond patterns (5 emitters each) below main grid |
+| Horizontal Spacing | 0.8 cm between emitters |
+| Vertical Spacing | 1.2 cm between rows |
+| Total Grid Size | 9.6 cm × 2.4 cm |
 
 ### Distance Calculation
 
-The pixel separation between the two reflected hot spots is inversely proportional to distance:
+Distance is derived from the apparent size of the reflected grid:
 
 ```
-distance = K / (pixel_separation × 2)
+scale = blob_width_px / visible_grid_width_cm
+optical_distance = focal_length_px / scale
+glass_distance = optical_distance / 2 × calibration_factor
 ```
 
-Where:
-- `K` = calibration constant (1335 pixels×cm for this setup)
-- `pixel_separation` = Euclidean distance between spots in pixels
+The division by 2 accounts for the reflection geometry (light travels camera → glass → PCB reflection → glass → camera).
 
 ### Angle Calculation
 
-Camera orientation is determined by the position of hot spots relative to the image center:
+Camera orientation is determined by the position of the camera hole (grid center) relative to the image center:
 
 ```
-yaw = -(spot_x - center_x) / 160 × 28°    # Horizontal angle
-pitch = (spot_y - center_y) / 120 × 22°   # Vertical angle
+yaw = (hole_x - image_center_x) / (image_width / 2) × (HFOV / 2)
+pitch = (hole_y - image_center_y) / (image_height / 2) × (VFOV / 2)
 ```
 
 ## Hardware Requirements
 
 | Component | Specification |
-|-----------|--------------|
+|-----------|---------------|
 | Thermal Camera | Seek Thermal SD314SPX Drone Core |
 | Resolution | 320 × 240 pixels |
 | Field of View | 56° horizontal, ~44° vertical |
-| Heat Emitters | 2× positioned at known offsets |
-| Emitter Position | 2.5cm above, 3.3cm left of camera |
+| PCB Emitter Grid | Custom 45-emitter pattern (see PCB Layout) |
+| Emitter Spacing | 0.8 cm horizontal, 1.2 cm vertical |
 
 ## Software Dependencies
 
-- **Seek Thermal SDK** - Camera interface
-- **SDL2** - Window management and rendering
-- **SDL2_ttf** - Font rendering
-- **C++11** or later
-
-## Project Structure
-
-```
-thermal_distance_sensor/
-├── CMakeLists.txt              # Build configuration
-├── README.md                   # This file
-├── include/
-│   ├── thermal_distance_sensor.h   # Core algorithm header
-│   └── rendering.h             # UI rendering header
-├── src/
-│   ├── main.cpp                # Application entry point
-│   ├── thermal_distance_sensor.cpp # Algorithm implementation
-│   └── rendering.cpp           # UI implementation
-└── docs/
-    └── algorithm.md            # Detailed algorithm documentation
-```
+| Dependency | Purpose |
+|------------|---------|
+| Seek Thermal SDK | Camera interface and frame capture |
+| SDL2 | Window management and rendering |
+| SDL2_ttf | Font rendering for UI |
+| C++11 or later | Language standard |
 
 ## Building
 
@@ -137,83 +131,107 @@ cmake --build . --config Release
 
 | Key | Action |
 |-----|--------|
-| `I` | Toggle isolation mode (show only top 15% temps) |
+| `I` | Toggle isolation mode (highlight hot regions only) |
 | `Q` | Quit application |
 
-### Display
+### Display Elements
 
-The application shows:
+| Element | Description |
+|---------|-------------|
+| Thermal Image | Color-mapped temperature display with sharpening |
+| Yellow Box | Detected PCB bounding box |
+| Cyan Circle | Camera hole detection |
+| Red Crosshair | Grid center / camera pointing direction |
+| Green Dots | Matched emitter positions |
+| White Crosshair | Image center reference |
 
-1. **Thermal Image** - Color-mapped temperature display
-2. **Spot Markers** - Green (ABOVE) and Cyan (LEFT) boxes on detected spots
-3. **Camera Marker** - Red dot showing where camera is pointing
-4. **Sidebar UI**:
-   - Distance measurement (large display)
-   - Spot temperatures
-   - Camera orientation (yaw/pitch)
-   - Visual tilt indicator
-   - Mode status
+### Sidebar Information
+
+- **Distance** - Measured distance to glass in centimeters
+- **Detection Stats** - Matched dots, rows detected, scale factor
+- **Orientation** - Yaw and pitch angles in degrees
+- **Tilt Indicator** - Visual representation of camera orientation
+- **Mode Status** - Current isolation mode state
 
 ## Algorithm Details
 
-### Hot Spot Detection
+### Blob Detection with Flood-Fill
 
-1. **Local Maxima Finding** - Scan for pixels that are hotter than their 5×5 neighborhood
-2. **Sub-pixel Centroid** - Use 7×7 Gaussian-weighted averaging for precise position:
-   ```
-   weight = (temp - threshold)³ × gaussian_spatial_weight
-   centroid = Σ(weight × position) / Σ(weight)
-   ```
-3. **Spot Identification** - Determine which spot is ABOVE vs LEFT based on relative position
-### Filtering
+The system uses flood-fill from the hottest pixel to identify connected thermal regions:
 
-The system uses adaptive low-pass filtering with bias correction:
+```cpp
+threshold = min_temp + (max_temp - min_temp) × 0.25
+// Flood-fill from peak, expanding to adjacent pixels above threshold
+// Track weighted centroid and bounding box during fill
+```
 
-1. **Adaptive Alpha** - Smoothing strength based on rate of change:
-   ```
-   alpha = min(0.01 + speed² × 2.0, 0.5)
-   ```
-   - Still: alpha ≈ 0.01 (heavy smoothing)
-   - Moving: alpha → 0.5 (responsive)
+### Validation Criteria
 
-2. **Bias Correction** - Prevents drift by slowly pulling toward median:
-   ```
-   bias = filtered - median(recent_raw_values)
-   filtered -= bias × 0.01
-   ```
+Detected blobs must pass multiple checks to be considered valid PCB detections:
+
+| Check | Requirement | Purpose |
+|-------|-------------|---------|
+| Minimum Size | ≥15×6 pixels | Reject noise |
+| Temperature Range | ≥3°C above ambient | Ensure active heat source |
+| Peak Count | ≥3 local maxima | Verify grid pattern (not single heat source) |
+| Cold Interior | ≥2°C below max in center | Confirm camera hole presence |
+
+### Temporal Persistence
+
+The system maintains detection through brief dropouts:
+
+```cpp
+// On successful detection:
+frames_since_detection = 0
+confidence = 1.0
+
+// On failed detection:
+frames_since_detection++
+confidence *= 0.85  // Decay 15% per frame
+
+// Return last known state if within holdover window (10 frames)
+if (frames_since_detection <= 10 && confidence > 0.1)
+    return last_valid_result
+```
+
+### Adaptive Smoothing
+
+Filter responsiveness adapts to motion:
+
+```cpp
+// Velocity tracking with asymmetric response
+if (instant_velocity > velocity)
+    velocity = 0.4 × instant + 0.6 × velocity  // Fast rise
+else
+    velocity = 0.02 × instant + 0.98 × velocity  // Slow decay
+
+// Smoothing alpha based on velocity
+alpha = 0.05 (stationary) → 0.4 (fast motion)
+```
 
 ## Performance
-S314SPX Mosaic Core Starter Kit 320x240, 57HFOV, FF
-
-![Performance Screenshot](assets/screenshot-performance.png)
 
 | Metric | Value |
 |--------|-------|
 | Frame Rate | ~27 Hz (camera limited) |
-| Latency | <100ms typical |
-| Distance Range | 10-100+ cm (depending on emitter power) |
+| Detection Latency | <100 ms typical |
+| Distance Range | 5-100+ cm |
 | Angular Range | ±28° yaw, ±22° pitch |
+| Distance Accuracy | ±2 cm typical (after calibration) |
 
-## Troubleshooting
+## API Reference
 
-### No spots detected
+### Core Classes
 
-- Ensure emitters are powered and producing heat
-- Check that glass surface is in view
-- Try disabling isolation mode (press `I`)
-- Verify emitters are within temperature threshold
-
-### Unstable readings
-
-- Ensure camera and emitters are rigidly mounted
-- Allow system to warm up (~30 seconds)
-- Check for interfering heat sources
-
-### Camera not found
-
-- Verify Seek Thermal SDK is installed
-- Check USB connection
-- Ensure proper permissions (Linux: add user to `plugdev` group)
+```cpp
+namespace thermal {
+    class PCBGridSensor {
+        GridResult detect(float* temps, int width, int height);
+        std::vector<HotSpot> findHotSpots(float* temps, int w, int h, 
+                                          float threshold, float scale);
+    };
+}
+```
 
 ## License
 
@@ -221,5 +239,6 @@ MIT License - See LICENSE file for details.
 
 ## Acknowledgments
 
-- Seek Thermal for the camera SDK
-- SDL2 development team
+- Seek Thermal for the camera SDK and hardware
+- SDL2 development team for the multimedia library
+- Prox SG for resources and platforms

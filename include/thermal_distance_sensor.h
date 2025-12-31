@@ -1,26 +1,6 @@
 /**
  * @file thermal_distance_sensor.h
- * @brief Thermal Distance Sensor - Dual Emitter Triangulation System
- * 
- * This system uses a thermal camera and two heat emitters to measure distance
- * to a reflective surface (glass) using triangulation. The emitters are positioned
- * at known offsets from the camera, and their reflections appear as hot spots
- * in the thermal image. The pixel separation between spots is inversely
- * proportional to distance.
- * 
- * @author shira421
- * @version 1.0.0
- * @date 2024
- * 
- * Hardware Requirements:
- * - Seek Thermal SD314SPX Drone Core (320x240, 56° HFOV)
- * - Two heat emitters positioned at known offsets from camera
- * - Reflective surface (glass) for measurement
- * 
- * Dependencies:
- * - Seek Thermal SDK
- * - SDL2 and SDL2_ttf
- * - C++11 or later
+ * @brief Implementation of core detection and ranging functions
  */
 
 #ifndef THERMAL_DISTANCE_SENSOR_H
@@ -38,244 +18,216 @@
 #endif
 
 namespace thermal {
-/** @brief Top percentage of temperatures shown in isolation mode */
-constexpr float ISOLATION_THRESHOLD = 0.15f;
 
-/** @brief Width of the UI sidebar in pixels */
 constexpr int SIDEBAR_WIDTH = 280;
 
-/**
- * @brief Represents a detected thermal region in the image
- */
-struct ThermalObject {
-    int id;                     ///< Unique identifier
-    int x, y;                   ///< Top-left corner of bounding box
-    int width, height;          ///< Bounding box dimensions
-    float min_temp;             ///< Minimum temperature in region (°C)
-    float max_temp;             ///< Maximum temperature in region (°C)
-    float avg_temp;             ///< Average temperature in region (°C)
-    SDL_Color box_color;        ///< Display color based on confidence
-};
+// Camera specifications (Seek Thermal SD314SPX)
+constexpr float HFOV_DEGREES = 56.0f;
+constexpr int SENSOR_WIDTH = 320;
+constexpr int SENSOR_HEIGHT = 240;
 
-/**
- * @brief Result of distance calculation
- */
-struct DistanceResult {
-    bool detected;              ///< Whether two valid spots were found
-    float distance_cm;          ///< Calculated distance to surface (cm)
-    float camera_yaw_deg;       ///< Camera horizontal angle (+ = right)
-    float camera_pitch_deg;     ///< Camera vertical angle (+ = up)
+// PCB Grid Physical Dimensions
+namespace PCBGrid {
+    constexpr float H_SPACING_CM = 0.8f;     // Horizontal dot spacing
+    constexpr float V_SPACING_CM = 1.2f;     // Vertical row spacing
     
-    int spot1_x, spot1_y;       ///< ABOVE emitter spot position (pixels)
-    int spot2_x, spot2_y;       ///< LEFT emitter spot position (pixels)
-    float spot1_temp;           ///< ABOVE spot temperature (°C)
-    float spot2_temp;           ///< LEFT spot temperature (°C)
+    // Main grid
+    constexpr int COLS = 13;                  // Columns 0-12
+    constexpr int ROWS = 3;                   // Rows 0-2
+    
+    // Dot counts per row
+    constexpr int ROW0_DOTS = 13;             // All columns
+    constexpr int ROW1_DOTS = 9;              // Cols 0-4 (5) + cols 8-11 (4)
+    constexpr int ROW2_DOTS = 13;             // All columns
+    constexpr int MAIN_DOTS = 35;             // 13 + 9 + 13
+    
+    // Anchor points
+    constexpr int ANCHOR_DOTS_EACH = 5;       // 5 dots per anchor (diamond)
+    constexpr int TOTAL_ANCHORS = 2;
+    constexpr int ANCHOR_DOTS = 10;           // 5 × 2
+    
+    // Total dots
+    constexpr int TOTAL_DOTS = 45;            // 35 + 10
+    
+    // Camera hole in row 1 (cols 5-7 missing)
+    constexpr int CAM_COL_START = 5;
+    constexpr int CAM_COL_END = 7;
+    
+    // Anchor positions (in reflected view)
+    // Physical left anchor (col 2) appears on right in reflection (col 10)
+    // Physical right anchor (col 10) appears on left in reflection (col 2)
+    constexpr int ANCHOR_LEFT_COL = 2;        // Right anchor appears here in reflection
+    constexpr int ANCHOR_RIGHT_COL = 10;      // Left anchor appears here in reflection
+    
+    // Anchor geometry
+    constexpr float ANCHOR_CENTER_BELOW_CM = 1.2f;  // Center is 1.2cm below row 2
+    constexpr float ANCHOR_CORNER_DIST_CM = 0.3f;   // Corner dots 0.3cm from center
+    
+    // Physical size of main grid
+    constexpr float GRID_WIDTH_CM = 12.0f * H_SPACING_CM;   // 12 gaps = 9.6cm
+    constexpr float GRID_HEIGHT_CM = 2.0f * V_SPACING_CM;   // 2 gaps = 2.4cm
+}
+
+/**
+ * @brief A detected/expected dot position
+ */
+struct GridDot {
+    // Grid position
+    int row;                // 0-2 for main grid, 3 for anchors
+    int col;                // 0-12 for main grid
+    int anchor_id;          // 0 = left anchor, 1 = right anchor, -1 = not anchor
+    int anchor_pos;         // 0-4 within anchor (0=center, 1-4=corners), -1 = not anchor
+    
+    // Expected position (normalized, relative to grid center)
+    float expected_x_cm;
+    float expected_y_cm;
+    
+    // Detected position (pixels, smoothed)
+    float pixel_x;
+    float pixel_y;
+    float temperature;
+    bool detected;
 };
 
 /**
- * @brief Score components for heat signature analysis
+ * @brief Result from grid detection
  */
-struct SignatureScore {
-    float gradient_quality;     ///< Radial temperature falloff quality (0-1)
-    float compactness;          ///< Size appropriateness score (0-1)
-    float peak_centrality;      ///< How centered is the peak (0-1)
-    float aspect_ratio_score;   ///< Shape regularity score (0-1)
-    float circularity;          ///< Roundness score (0-1)
-    float overall_score;        ///< Weighted combined score (0-1)
+struct GridResult {
+    bool valid;             // Detection successful?
+    
+    // Measurements
+    float distance_cm;      // Distance to glass surface
+    float yaw_deg;          // Camera yaw (+ = pointing right)
+    float pitch_deg;        // Camera pitch (+ = pointing up)
+    
+    // Detection confidence (1.0 = fresh detection, decays during holdover)
+    float confidence;
+    
+    // Grid info
+    float grid_width_px;    // Detected grid width in pixels
+    float grid_height_px;   // Detected grid height in pixels
+    float pixels_per_cm;    // Scale factor
+    float grid_center_x;    // Grid center X in image (camera position)
+    float grid_center_y;    // Grid center Y in image
+    
+    // Detected camera hole circle
+    float circle_radius;    // Detected circle radius in pixels
+    bool circle_found;      // Was the camera circle detected?
+    
+    // Row bounds
+    float main_grid_x_min;  // Left edge X
+    float main_grid_x_max;  // Right edge X
+    float main_grid_y_min;  // Top row Y
+    float main_grid_y_max;  // Bottom row Y
+    int num_main_rows;      // Rows detected
+    
+    // Detection stats
+    int total_dots_detected;
+    int main_dots_detected;
+    int anchor_dots_detected;
+    float max_temp;
+    float hot_region_temp;
+    
+    // All 45 dot positions (detected or expected)
+    std::vector<GridDot> dots;
+    
+    // Anchor centers (legacy - not used)
+    float left_anchor_x, left_anchor_y;
+    float right_anchor_x, right_anchor_y;
+    bool left_anchor_valid, right_anchor_valid;
 };
 
 /**
- * @brief Main class for thermal triangulation distance measurement
- * 
- * This class implements a dual-emitter triangulation system for measuring
- * distance to reflective surfaces using thermal imaging. It handles:
- * - Hot spot detection with sub-pixel accuracy
- * - Spot identification (which emitter each spot corresponds to)
- * - Distance calculation from pixel separation
- * - Angle calculation for camera orientation
- * - Temporal filtering with bias correction for stable output
- * 
- * Physical Setup:
- * ```
- *     [ABOVE EMITTER] ← 2.5cm above camera
- *            |
- *            | 2.5cm
- *            |
- *     [CAMERA]-------- 3.3cm --------[LEFT EMITTER]
- * ```
- * 
- * The emitters create two hot spots visible in the thermal image via
- * reflection off glass. The pixel separation between spots is inversely
- * proportional to distance: closer = more separation, farther = less.
- * 
- * Usage:
- * @code
- * TriangulationDistanceSensor sensor;
- * 
- * // In frame callback:
- * float* temps = get_temperature_data();
- * DistanceResult result = sensor.calculate(temps, 320, 240);
- * 
- * if (result.detected) {
- *     printf("Distance: %.2f cm\n", result.distance_cm);
- *     printf("Yaw: %.2f°, Pitch: %.2f°\n", 
- *            result.camera_yaw_deg, result.camera_pitch_deg);
- * }
- * @endcode
+ * @brief Main sensor class for PCB grid distance measurement
  */
-class TriangulationDistanceSensor {
+class PCBGridSensor {
 public:
-    /**
-     * @brief Construct a new sensor with default physical parameters
-     * 
-     * Initializes filter state and calculates derived values (VFOV, focal length)
-     * from the physical constants.
-     */
-    TriangulationDistanceSensor();
+    PCBGridSensor();
     
     /**
-     * @brief Calculate distance and orientation from thermal frame
-     * 
-     * This is the main entry point for distance measurement. It:
-     * 1. Finds the two hottest local maxima in the image
-     * 2. Calculates sub-pixel centroids using Gaussian-weighted averaging
-     * 3. Identifies which spot corresponds to which emitter
-     * 4. Calculates distance from pixel separation
-     * 5. Calculates camera yaw/pitch from spot positions
-     * 6. Applies temporal filtering with bias correction
-     * 
-     * @param temps Temperature array in row-major order (°C)
-     * @param width Image width in pixels (typically 320)
-     * @param height Image height in pixels (typically 240)
-     * @return DistanceResult containing distance, angles, and spot info
+     * @brief Hot spot detected in thermal image
      */
-    DistanceResult calculate(float* temps, int width, int height);
-
-private:
-    /** @brief Vertical offset of ABOVE emitter from camera (cm) */
-    static constexpr float BASELINE_ABOVE_CM = 2.5f;
-    
-    /** @brief Horizontal offset of LEFT emitter from camera (cm) */
-    static constexpr float BASELINE_LEFT_CM = 3.3f;
-    
-    /** @brief Camera horizontal field of view (degrees) */
-    static constexpr float HFOV_DEGREES = 56.0f;
-    
-    /** @brief Thermal image width (pixels) */
-    static constexpr float SENSOR_WIDTH = 320.0f;
-    
-    /** @brief Thermal image height (pixels) */
-    static constexpr float SENSOR_HEIGHT = 240.0f;
-    
-    /** @brief Calibration constant: pixels × cm at reference distance */
-    static constexpr float K_CALIBRATION = 1335.0f;
-    
-    float vfov_degrees_;        ///< Vertical FOV calculated from HFOV
-    float focal_length_pixels_; ///< Focal length in pixel units
-    
-    float filtered_dist_, filtered_yaw_, filtered_pitch_;
-    float filtered_spot1_x_, filtered_spot1_y_;
-    float filtered_spot2_x_, filtered_spot2_y_;
-    bool filter_initialized_;
-    
-    float prev_dist_, prev_yaw_, prev_pitch_;
-    float prev_spot1_x_, prev_spot1_y_;
-    float prev_spot2_x_, prev_spot2_y_;
-    
-    std::vector<float> dist_buffer_;
-    std::vector<float> yaw_buffer_;
-    std::vector<float> pitch_buffer_;
-    static constexpr size_t MEDIAN_WINDOW = 21;
-    
-    /** @brief Internal representation of a detected hot spot */
     struct HotSpot {
-        float x, y;     ///< Sub-pixel position
-        float temp;     ///< Peak temperature
-        bool valid;     ///< Whether detection was successful
+        float x, y;
+        float temperature;
     };
     
     /**
-     * @brief Calculate median of buffer with new value added
-     * @param buffer Rolling buffer of values
-     * @param new_val New value to add
-     * @return Median of buffer contents
+     * @brief Process a thermal frame and detect the grid
      */
-    float getMedian(std::vector<float>& buffer, float new_val);
+    GridResult detect(float* temps, int width, int height);
     
     /**
-     * @brief Find sub-pixel centroid of hot spot using Gaussian weighting
-     * 
-     * Uses a 7x7 window with Gaussian spatial weights and cubic temperature
-     * weighting to calculate a precise centroid position.
-     * 
-     * @param temps Temperature array
-     * @param width Image width
-     * @param height Image height
-     * @param center_x Seed X position (integer pixel)
-     * @param center_y Seed Y position (integer pixel)
-     * @param max_temp Peak temperature at seed
-     * @return HotSpot with sub-pixel position
+     * @brief Find local temperature maxima (hot spots) - public for use by helpers
+     * @param scale Pixels per cm - used to adjust detection radius for close/far distances
      */
-    HotSpot findHotSpotCentroid(float* temps, int width, int height,
-                                 int center_x, int center_y, float max_temp);
+    std::vector<HotSpot> findHotSpots(float* temps, int w, int h, float threshold, float scale = 10.0f);
+
+private:
+    // Camera parameters
+    float vfov_degrees_;
+    float focal_length_px_;
+    
+    // Expected dot positions (45 dots)
+    std::vector<GridDot> expected_dots_;
+    
+    // Smoothed dot positions (persistent across frames)
+    std::vector<float> smoothed_x_;
+    std::vector<float> smoothed_y_;
+    
+    // Filter state
+    bool initialized_;
+    float filt_dist_, filt_yaw_, filt_pitch_;
+    float filt_center_x_, filt_center_y_;
+    float filt_scale_;
+    
+    // Smoothed circle position (heavy filtering to reduce jitter)
+    float smooth_circle_x_, smooth_circle_y_;
+    bool circle_initialized_;
+    
+    // Filtered bounding box (for stability)
+    float filt_x_min_, filt_x_max_, filt_y_min_, filt_y_max_;
+    
+    // Velocity tracking for adaptive smoothing
+    float prev_center_x_, prev_center_y_;
+    float velocity_;
+    
+    // Detection persistence (temporal smoothing)
+    int frames_since_detection_;      // Frames since last valid detection
+    float detection_confidence_;      // 0.0 to 1.0, decays over time
+    static const int MAX_HOLDOVER_FRAMES = 10;  // Hold last position for this many frames
+    
+    // Median buffers
+    std::vector<float> dist_buffer_;
+    std::vector<float> yaw_buffer_;
+    std::vector<float> pitch_buffer_;
+    static const int MEDIAN_SIZE = 1;  // Minimal for maximum responsiveness
+    
+    /**
+     * @brief Initialize the expected 45-dot grid layout
+     */
+    void initializeExpectedGrid();
+    
+    /**
+     * @brief Match detected hot spots to expected grid positions
+     */
+    void matchDotsToGrid(const std::vector<HotSpot>& spots, 
+                         float center_x, float center_y, float scale,
+                         std::vector<GridDot>& dots);
+    
+    /**
+     * @brief Apply heavy smoothing to reduce jitter
+     */
+    float smooth(float raw, float& filtered, float alpha);
+    float median(std::vector<float>& buffer, float new_val);
 };
 
-/**
- * @brief Convert temperature to display color
- * 
- * Maps temperature values to a Blue→Cyan→Green→Yellow→Red gradient.
- * In isolation mode, only the top 15% of temperatures are colored;
- * everything else is black.
- * 
- * @param temp Temperature value (°C)
- * @param min_temp Minimum temperature in frame (°C)
- * @param max_temp Maximum temperature in frame (°C)
- * @param isolation_mode If true, only show top 15% of range
- * @return SDL_Color for display
- */
-SDL_Color mapTemperature(float temp, float min_temp, float max_temp, 
-                         bool isolation_mode);
+SDL_Color mapTemperature(float temp, float min_temp, float max_temp, bool isolation);
 
-/**
- * @brief Find connected components in binary image using flood fill
- * 
- * @param binary_map 2D boolean array of hot pixels
- * @param width Image width
- * @param height Image height
- * @return 2D array of component labels (0 = background)
- */
-std::vector<std::vector<int>> findConnectedComponents(
-    std::vector<std::vector<bool>>& binary_map, int width, int height);
-
-/**
- * @brief Analyze thermal object to score signature quality
- * 
- * Evaluates gradient quality, peak centrality, aspect ratio,
- * circularity, and compactness to determine if object is a
- * valid heat signature vs noise.
- * 
- * @param temps Temperature array
- * @param width Image width
- * @param height Image height
- * @param obj Object to analyze
- * @return SignatureScore with component and overall scores
- */
-SignatureScore analyzeSignaturePattern(float* temps, int width, int height,
-                                       const ThermalObject& obj);
-
-/**
- * @brief Detect thermal objects in frame
- * 
- * Full pipeline: threshold → connected components → scoring → top 2
- * 
- * @param temps Temperature array
- * @param width Image width
- * @param height Image height
- * @param next_id Reference to ID counter (incremented for each new object)
- * @return Vector of detected ThermalObjects (max 2)
- */
-std::vector<ThermalObject> detectThermalObjects(float* temps, int width, 
-                                                 int height, int& next_id);
+float sharpenPixel(float* temps, int x, int y, int w, int h, float strength);
+void sharpenFrame(float* input, float* output, int w, int h, float strength);
+SDL_Color mapTemperatureSharp(float temp, float sharpened_temp,
+                               float min_temp, float max_temp, bool isolation);
 
 } // namespace thermal
 

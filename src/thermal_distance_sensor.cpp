@@ -1,732 +1,930 @@
 /**
  * @file thermal_distance_sensor.cpp
- * @brief Implementation of thermal triangulation distance sensor
+ * @brief Implementation of core detection and ranging functions
  */
 
 #include "thermal_distance_sensor.h"
-#include <queue>
-#include <map>
 #include <cmath>
+#include <algorithm>
+#include <numeric>
+
+static const float PI_F = 3.14159265f;
+
+// Physical grid dimensions (known constants)
+static const float GRID_PHYSICAL_WIDTH_CM = 9.6f;
+static const float GRID_PHYSICAL_HEIGHT_CM = 2.4f;
+static const float CAMERA_HOLE_DIAMETER_CM = 0.8f;
 
 namespace thermal {
 
-TriangulationDistanceSensor::TriangulationDistanceSensor()
-    : filtered_dist_(0), filtered_yaw_(0), filtered_pitch_(0)
-    , filtered_spot1_x_(0), filtered_spot1_y_(0)
-    , filtered_spot2_x_(0), filtered_spot2_y_(0)
-    , filter_initialized_(false)
-    , prev_dist_(0), prev_yaw_(0), prev_pitch_(0)
-    , prev_spot1_x_(0), prev_spot1_y_(0)
-    , prev_spot2_x_(0), prev_spot2_y_(0)
+PCBGridSensor::PCBGridSensor()
+    : initialized_(false)
+    , filt_dist_(0), filt_yaw_(0), filt_pitch_(0)
+    , filt_center_x_(0), filt_center_y_(0)
+    , filt_scale_(0)
+    , smooth_circle_x_(0), smooth_circle_y_(0), circle_initialized_(false)
+    , filt_x_min_(0), filt_x_max_(0), filt_y_min_(0), filt_y_max_(0)
+    , prev_center_x_(0), prev_center_y_(0)
+    , velocity_(0)
+    , frames_since_detection_(999)
+    , detection_confidence_(0)
 {
-    // Calculate vertical FOV from horizontal FOV using pinhole camera model
-    float aspect_ratio = SENSOR_HEIGHT / SENSOR_WIDTH;
-    float hfov_half_rad = (HFOV_DEGREES / 2.0f) * static_cast<float>(M_PI) / 180.0f;
-    float vfov_half_rad = std::atan(std::tan(hfov_half_rad) * aspect_ratio);
-    vfov_degrees_ = (vfov_half_rad * 180.0f / static_cast<float>(M_PI)) * 2.0f;
+    float aspect = static_cast<float>(SENSOR_HEIGHT) / static_cast<float>(SENSOR_WIDTH);
+    float hfov_rad = (HFOV_DEGREES / 2.0f) * PI_F / 180.0f;
+    float vfov_rad = std::atan(std::tan(hfov_rad) * aspect);
+    vfov_degrees_ = vfov_rad * 2.0f * 180.0f / PI_F;
+    focal_length_px_ = (SENSOR_WIDTH / 2.0f) / std::tan(hfov_rad);
     
-    // Calculate focal length in pixels
-    focal_length_pixels_ = (SENSOR_WIDTH / 2.0f) / std::tan(hfov_half_rad);
+    initializeExpectedGrid();
     
-    // Reserve space for median buffers
-    dist_buffer_.reserve(MEDIAN_WINDOW);
-    yaw_buffer_.reserve(MEDIAN_WINDOW);
-    pitch_buffer_.reserve(MEDIAN_WINDOW);
+    smoothed_x_.resize(PCBGrid::TOTAL_DOTS, 0);
+    smoothed_y_.resize(PCBGrid::TOTAL_DOTS, 0);
+    
+    dist_buffer_.reserve(MEDIAN_SIZE);
+    yaw_buffer_.reserve(MEDIAN_SIZE);
+    pitch_buffer_.reserve(MEDIAN_SIZE);
 }
 
-float TriangulationDistanceSensor::getMedian(std::vector<float>& buffer, float new_val) {
-    buffer.push_back(new_val);
-    if (buffer.size() > MEDIAN_WINDOW) {
-        buffer.erase(buffer.begin());
+void PCBGridSensor::initializeExpectedGrid() {
+    expected_dots_.clear();
+    expected_dots_.reserve(PCBGrid::TOTAL_DOTS);
+    
+    float cam_col = 6.0f;
+    float cam_row = 1.0f;
+    
+    // Row 0: 13 dots
+    for (int col = 0; col < 13; col++) {
+        GridDot dot;
+        dot.row = 0; dot.col = col;
+        dot.anchor_id = -1; dot.anchor_pos = -1;
+        dot.expected_x_cm = (col - cam_col) * PCBGrid::H_SPACING_CM;
+        dot.expected_y_cm = (0 - cam_row) * PCBGrid::V_SPACING_CM;
+        dot.pixel_x = 0; dot.pixel_y = 0;
+        dot.temperature = 0; dot.detected = false;
+        expected_dots_.push_back(dot);
     }
     
-    // Copy and sort to find median
-    std::vector<float> sorted = buffer;
-    std::sort(sorted.begin(), sorted.end());
+    // Row 1: 9 dots (skip camera hole)
+    for (int col = 0; col < 13; col++) {
+        if (col == 0) continue;
+        if (col >= 5 && col <= 7) continue;
+        GridDot dot;
+        dot.row = 1; dot.col = col;
+        dot.anchor_id = -1; dot.anchor_pos = -1;
+        dot.expected_x_cm = (col - cam_col) * PCBGrid::H_SPACING_CM;
+        dot.expected_y_cm = 0;
+        dot.pixel_x = 0; dot.pixel_y = 0;
+        dot.temperature = 0; dot.detected = false;
+        expected_dots_.push_back(dot);
+    }
     
-    size_t mid = sorted.size() / 2;
-    if (sorted.size() % 2 == 0) {
-        return (sorted[mid - 1] + sorted[mid]) / 2.0f;
-    } else {
-        return sorted[mid];
+    // Row 2: 13 dots
+    for (int col = 0; col < 13; col++) {
+        GridDot dot;
+        dot.row = 2; dot.col = col;
+        dot.anchor_id = -1; dot.anchor_pos = -1;
+        dot.expected_x_cm = (col - cam_col) * PCBGrid::H_SPACING_CM;
+        dot.expected_y_cm = (2 - cam_row) * PCBGrid::V_SPACING_CM;
+        dot.pixel_x = 0; dot.pixel_y = 0;
+        dot.temperature = 0; dot.detected = false;
+        expected_dots_.push_back(dot);
     }
 }
 
-TriangulationDistanceSensor::HotSpot 
-TriangulationDistanceSensor::findHotSpotCentroid(
-    float* temps, int width, int height,
-    int center_x, int center_y, float max_temp)
-{
-    HotSpot spot;
-    spot.valid = false;
-    spot.x = 0;
-    spot.y = 0;
-    spot.temp = 0;
+struct ThermalBlob {
+    float center_x, center_y;
+    float min_x, max_x, min_y, max_y;
+    float width, height;
+    float peak_temp;
+    int pixel_count;
+    bool valid;
     
-    // 7x7 Gaussian kernel (sigma ≈ 1.5)
-    // Provides spatial weighting to reduce edge noise
-    static const float gauss[7][7] = {
-        {0.01f, 0.02f, 0.03f, 0.04f, 0.03f, 0.02f, 0.01f},
-        {0.02f, 0.04f, 0.06f, 0.07f, 0.06f, 0.04f, 0.02f},
-        {0.03f, 0.06f, 0.09f, 0.12f, 0.09f, 0.06f, 0.03f},
-        {0.04f, 0.07f, 0.12f, 0.15f, 0.12f, 0.07f, 0.04f},
-        {0.03f, 0.06f, 0.09f, 0.12f, 0.09f, 0.06f, 0.03f},
-        {0.02f, 0.04f, 0.06f, 0.07f, 0.06f, 0.04f, 0.02f},
-        {0.01f, 0.02f, 0.03f, 0.04f, 0.03f, 0.02f, 0.01f}
-    };
+    float cold_center_x, cold_center_y;
+    float cold_radius;
+    bool cold_circle_found;
+};
+
+bool validatePCBShape(const ThermalBlob& blob, float* temps, int width, int height, 
+                      float avg_temp, float max_temp) {
+    if (!blob.valid) return false;
     
-    // Include pixels within 3°C of peak
-    float threshold = max_temp - 3.0f;
-    float sum_weight = 0.0f, sum_x = 0.0f, sum_y = 0.0f;
+    if (blob.width < 15 || blob.height < 6) return false;
     
-    // Iterate over 7x7 window
-    for (int dy = -3; dy <= 3; dy++) {
-        for (int dx = -3; dx <= 3; dx++) {
-            int px = center_x + dx;
-            int py = center_y + dy;
+    float temp_range = max_temp - avg_temp;
+    if (temp_range < 3.0f) return false;  // Need at least 3°C above ambient
+    
+    float hot_thresh = avg_temp + temp_range * 0.45f;
+    int peak_count = 0;
+    const int peak_radius = 3;
+    
+    int bx_min = static_cast<int>(blob.min_x) + peak_radius;
+    int bx_max = static_cast<int>(blob.max_x) - peak_radius;
+    int by_min = static_cast<int>(blob.min_y) + peak_radius;
+    int by_max = static_cast<int>(blob.max_y) - peak_radius;
+    
+    // Clamp to image bounds
+    bx_min = std::max(peak_radius, bx_min);
+    bx_max = std::min(width - peak_radius - 1, bx_max);
+    by_min = std::max(peak_radius, by_min);
+    by_max = std::min(height - peak_radius - 1, by_max);
+    
+    if (bx_max <= bx_min || by_max <= by_min) return false;
+    
+    for (int y = by_min; y <= by_max; y += 2) {  // Sample every 2 pixels
+        for (int x = bx_min; x <= bx_max; x += 2) {
+            float t = temps[y * width + x];
+            if (t < hot_thresh) continue;
             
-            if (px >= 0 && px < width && py >= 0 && py < height) {
-                float temp = temps[py * width + px];
-                if (temp > threshold) {
-                    // Combined weight: temperature³ × Gaussian spatial weight
-                    // Cubic weighting strongly emphasizes the peak
-                    float temp_weight = (temp - threshold);
-                    temp_weight = temp_weight * temp_weight * temp_weight;
-                    float spatial_weight = gauss[dy + 3][dx + 3];
-                    float weight = temp_weight * spatial_weight;
-                    
-                    sum_weight += weight;
-                    sum_x += weight * static_cast<float>(px);
-                    sum_y += weight * static_cast<float>(py);
-                }
-            }
-        }
-    }
-    
-    if (sum_weight > 0) {
-        spot.x = sum_x / sum_weight;
-        spot.y = sum_y / sum_weight;
-        spot.temp = max_temp;
-        spot.valid = true;
-    } else {
-        // Fallback to integer position if weighting fails
-        spot.x = static_cast<float>(center_x);
-        spot.y = static_cast<float>(center_y);
-        spot.temp = max_temp;
-        spot.valid = true;
-    }
-    
-    return spot;
-}
-
-DistanceResult TriangulationDistanceSensor::calculate(
-    float* temps, int width, int height)
-{
-    DistanceResult result;
-    result.detected = false;
-    result.distance_cm = 0;
-    result.camera_yaw_deg = 0;
-    result.camera_pitch_deg = 0;
-    result.spot1_x = 0;
-    result.spot1_y = 0;
-    result.spot2_x = 0;
-    result.spot2_y = 0;
-    result.spot1_temp = 0;
-    result.spot2_temp = 0;
-    
-    std::vector<float> all_temps;
-    all_temps.reserve(width * height);
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            all_temps.push_back(temps[y * width + x]);
-        }
-    }
-    std::sort(all_temps.begin(), all_temps.end());
-    
-    float background_temp = all_temps[all_temps.size() / 2];  // Median
-    float temp_80th = all_temps[(all_temps.size() * 80) / 100];
-    
-    // Detection threshold: at least 0.1°C above background, or 80th percentile
-    constexpr float MIN_TEMP_ABOVE_BG = 0.1f;
-    constexpr int NEIGHBORHOOD = 2;  // 5x5 window for local max detection
-    float detection_threshold = std::min(background_temp + MIN_TEMP_ABOVE_BG, temp_80th);
-    
-    struct LocalMax {
-        int x, y;
-        float temp;
-    };
-    
-    std::vector<LocalMax> local_maxima;
-    
-    for (int y = NEIGHBORHOOD; y < height - NEIGHBORHOOD; y++) {
-        for (int x = NEIGHBORHOOD; x < width - NEIGHBORHOOD; x++) {
-            float center_temp = temps[y * width + x];
-            if (center_temp < detection_threshold) continue;
-            
-            // Check if this pixel is the maximum in its neighborhood
-            bool is_local_max = true;
-            for (int dy = -NEIGHBORHOOD; dy <= NEIGHBORHOOD && is_local_max; dy++) {
-                for (int dx = -NEIGHBORHOOD; dx <= NEIGHBORHOOD; dx++) {
+            // Check if local maximum
+            bool is_peak = true;
+            for (int dy = -peak_radius; dy <= peak_radius && is_peak; dy++) {
+                for (int dx = -peak_radius; dx <= peak_radius; dx++) {
                     if (dx == 0 && dy == 0) continue;
-                    if (temps[(y + dy) * width + (x + dx)] > center_temp) {
-                        is_local_max = false;
+                    if (temps[(y + dy) * width + (x + dx)] > t) {
+                        is_peak = false;
                         break;
                     }
                 }
             }
-            
-            if (is_local_max) {
-                LocalMax lm;
-                lm.x = x;
-                lm.y = y;
-                lm.temp = center_temp;
-                local_maxima.push_back(lm);
+            if (is_peak) peak_count++;
+        }
+    }
+    
+    if (peak_count < 3) return false;
+    
+    float center_x = (blob.min_x + blob.max_x) / 2.0f;
+    float center_y = (blob.min_y + blob.max_y) / 2.0f;
+    int cx = static_cast<int>(center_x);
+    int cy = static_cast<int>(center_y);
+    
+    // Find minimum temperature in the central region
+    float min_center_temp = max_temp;
+    int sample_r = static_cast<int>(std::min(blob.width, blob.height) * 0.25f);
+    sample_r = std::max(3, std::min(sample_r, 20));
+    
+    for (int dy = -sample_r; dy <= sample_r; dy++) {
+        for (int dx = -sample_r; dx <= sample_r; dx++) {
+            int px = cx + dx, py = cy + dy;
+            if (px >= 0 && px < width && py >= 0 && py < height) {
+                min_center_temp = std::min(min_center_temp, temps[py * width + px]);
             }
         }
     }
     
-    // Sort by temperature (descending) using simple bubble sort for C++11 compat
-    for (size_t i = 0; i < local_maxima.size(); i++) {
-        for (size_t j = i + 1; j < local_maxima.size(); j++) {
-            if (local_maxima[j].temp > local_maxima[i].temp) {
-                LocalMax tmp = local_maxima[i];
-                local_maxima[i] = local_maxima[j];
-                local_maxima[j] = tmp;
-            }
-        }
-    }
+    if (min_center_temp > max_temp - 2.0f) return false;
     
-    if (local_maxima.size() < 2) {
-        return result;  // Need at least 2 spots
-    }
-    
-    constexpr float MIN_SEPARATION = 10.0f;  // Minimum pixel separation
-    LocalMax spot1 = local_maxima[0];  // Hottest spot
-    LocalMax spot2;
-    bool found_second = false;
-    
-    for (size_t i = 1; i < local_maxima.size(); i++) {
-        float dx = static_cast<float>(local_maxima[i].x - spot1.x);
-        float dy = static_cast<float>(local_maxima[i].y - spot1.y);
-        float sep = std::sqrt(dx * dx + dy * dy);
-        
-        if (sep >= MIN_SEPARATION) {
-            spot2 = local_maxima[i];
-            found_second = true;
-            break;
-        }
-    }
-    
-    if (!found_second) return result;
-    
-    HotSpot hotspot1 = findHotSpotCentroid(temps, width, height, 
-                                           spot1.x, spot1.y, spot1.temp);
-    HotSpot hotspot2 = findHotSpotCentroid(temps, width, height, 
-                                           spot2.x, spot2.y, spot2.temp);
-    
-    if (!hotspot1.valid || !hotspot2.valid) return result;
-    
-    HotSpot spot_above, spot_left;
-    float dx = hotspot2.x - hotspot1.x;
-    float dy = hotspot2.y - hotspot1.y;
-    
-    if (std::fabs(dy) > std::fabs(dx)) {
-        // Vertical separation dominates - use Y position
-        if (hotspot1.y <= hotspot2.y) {
-            spot_above = hotspot1;
-            spot_left = hotspot2;
-        } else {
-            spot_above = hotspot2;
-            spot_left = hotspot1;
-        }
-    } else {
-        // Horizontal separation dominates - use X position
-        if (hotspot1.x <= hotspot2.x) {
-            spot_left = hotspot1;
-            spot_above = hotspot2;
-        } else {
-            spot_left = hotspot2;
-            spot_above = hotspot1;
-        }
-    }
-    
-    constexpr float center_x = 160.0f;
-    constexpr float center_y = 120.0f;
-    
-    // Spot offsets from image center (in pixels)
-    float spot_above_offset_x = spot_above.x - center_x;
-    float spot_left_offset_y = spot_left.y - center_y;
-    
-    // Convert to degrees using FOV scaling
-    // HFOV = 56° across 320px → 28° per 160px from center
-    // VFOV ≈ 44° across 240px → 22° per 120px from center
-    float spot_yaw_deg = (spot_above_offset_x / 160.0f) * 28.0f;
-    float spot_pitch_deg = (spot_left_offset_y / 120.0f) * 22.0f;
-    
-    // Camera direction is OPPOSITE to spot position
-    // Spot moves right → camera points left (negative yaw)
-    // Spot moves down → camera points up (positive pitch)
-    float camera_yaw_raw = -spot_yaw_deg;
-    float camera_pitch_raw = spot_pitch_deg;
-    
-    float dx_pixels = spot_above.x - spot_left.x;
-    float dy_pixels = spot_above.y - spot_left.y;
-    float separation_pixels = std::sqrt(dx_pixels * dx_pixels + dy_pixels * dy_pixels);
-    
-    // Distance formula: d = K / separation
-    float d_separation = K_CALIBRATION / separation_pixels;
-    
-    // Account for reflection (light travels to surface AND back)
-    float raw_dist = d_separation / 2.0f;
-    
-    // Raw spot positions
-    float raw_spot1_x = spot_above.x;
-    float raw_spot1_y = spot_above.y;
-    float raw_spot2_x = spot_left.x;
-    float raw_spot2_y = spot_left.y;
-    
-    float final_dist, final_yaw, final_pitch;
-    float final_spot1_x, final_spot1_y, final_spot2_x, final_spot2_y;
-    
-    if (!filter_initialized_) {
-        // First frame - initialize all filter state
-        filtered_dist_ = raw_dist;
-        filtered_yaw_ = camera_yaw_raw;
-        filtered_pitch_ = camera_pitch_raw;
-        filtered_spot1_x_ = raw_spot1_x;
-        filtered_spot1_y_ = raw_spot1_y;
-        filtered_spot2_x_ = raw_spot2_x;
-        filtered_spot2_y_ = raw_spot2_y;
-        
-        prev_dist_ = raw_dist;
-        prev_yaw_ = camera_yaw_raw;
-        prev_pitch_ = camera_pitch_raw;
-        prev_spot1_x_ = raw_spot1_x;
-        prev_spot1_y_ = raw_spot1_y;
-        prev_spot2_x_ = raw_spot2_x;
-        prev_spot2_y_ = raw_spot2_y;
-        
-        filter_initialized_ = true;
-        
-        final_dist = raw_dist;
-        final_yaw = camera_yaw_raw;
-        final_pitch = camera_pitch_raw;
-        final_spot1_x = raw_spot1_x;
-        final_spot1_y = raw_spot1_y;
-        final_spot2_x = raw_spot2_x;
-        final_spot2_y = raw_spot2_y;
-    } else {
-        // Calculate speed of change for adaptive alpha
-        float dist_speed = std::fabs(raw_dist - prev_dist_);
-        float yaw_speed = std::fabs(camera_yaw_raw - prev_yaw_);
-        float pitch_speed = std::fabs(camera_pitch_raw - prev_pitch_);
-        float spot1_speed = std::sqrt(
-            std::pow(raw_spot1_x - prev_spot1_x_, 2.0f) + 
-            std::pow(raw_spot1_y - prev_spot1_y_, 2.0f));
-        float spot2_speed = std::sqrt(
-            std::pow(raw_spot2_x - prev_spot2_x_, 2.0f) + 
-            std::pow(raw_spot2_y - prev_spot2_y_, 2.0f));
-        
-        // Update previous values BEFORE filtering (prevents drift)
-        prev_dist_ = raw_dist;
-        prev_yaw_ = camera_yaw_raw;
-        prev_pitch_ = camera_pitch_raw;
-        prev_spot1_x_ = raw_spot1_x;
-        prev_spot1_y_ = raw_spot1_y;
-        prev_spot2_x_ = raw_spot2_x;
-        prev_spot2_y_ = raw_spot2_y;
-        
-        // Adaptive alpha: squared speed for aggressive noise rejection
-        // Base alpha = 0.01 (smooth when still), max = 0.5 (responsive when moving)
-        float dist_alpha = std::min(0.01f + dist_speed * dist_speed * 2.0f, 0.5f);
-        float angle_alpha = std::min(
-            0.01f + std::max(yaw_speed, pitch_speed) * 
-                    std::max(yaw_speed, pitch_speed) * 1.0f, 0.5f);
-        float spot_alpha = std::min(
-            0.01f + std::max(spot1_speed, spot2_speed) * 
-                    std::max(spot1_speed, spot2_speed) * 0.5f, 0.5f);
-        
-        // Low-pass filter toward raw values
-        filtered_dist_ = dist_alpha * raw_dist + (1.0f - dist_alpha) * filtered_dist_;
-        filtered_yaw_ = angle_alpha * camera_yaw_raw + (1.0f - angle_alpha) * filtered_yaw_;
-        filtered_pitch_ = angle_alpha * camera_pitch_raw + (1.0f - angle_alpha) * filtered_pitch_;
-        filtered_spot1_x_ = spot_alpha * raw_spot1_x + (1.0f - spot_alpha) * filtered_spot1_x_;
-        filtered_spot1_y_ = spot_alpha * raw_spot1_y + (1.0f - spot_alpha) * filtered_spot1_y_;
-        filtered_spot2_x_ = spot_alpha * raw_spot2_x + (1.0f - spot_alpha) * filtered_spot2_x_;
-        filtered_spot2_y_ = spot_alpha * raw_spot2_y + (1.0f - spot_alpha) * filtered_spot2_y_;
-        
-        // Bias correction: slowly pull toward long-term median
-        // Prevents systematic drift while maintaining smoothing
-        float raw_avg_dist = getMedian(dist_buffer_, raw_dist);
-        float bias = filtered_dist_ - raw_avg_dist;
-        filtered_dist_ -= bias * 0.01f;
-        
-        float raw_avg_yaw = getMedian(yaw_buffer_, camera_yaw_raw);
-        float yaw_bias = filtered_yaw_ - raw_avg_yaw;
-        filtered_yaw_ -= yaw_bias * 0.01f;
-        
-        float raw_avg_pitch = getMedian(pitch_buffer_, camera_pitch_raw);
-        float pitch_bias = filtered_pitch_ - raw_avg_pitch;
-        filtered_pitch_ -= pitch_bias * 0.01f;
-        
-        final_dist = filtered_dist_;
-        final_yaw = filtered_yaw_;
-        final_pitch = filtered_pitch_;
-        final_spot1_x = filtered_spot1_x_;
-        final_spot1_y = filtered_spot1_y_;
-        final_spot2_x = filtered_spot2_x_;
-        final_spot2_y = filtered_spot2_y_;
-    }
-    
-    result.detected = true;
-    result.distance_cm = final_dist;
-    result.camera_yaw_deg = final_yaw;
-    result.camera_pitch_deg = final_pitch;
-    result.spot1_x = static_cast<int>(std::round(final_spot1_x));
-    result.spot1_y = static_cast<int>(std::round(final_spot1_y));
-    result.spot1_temp = spot_above.temp;
-    result.spot2_x = static_cast<int>(std::round(final_spot2_x));
-    result.spot2_y = static_cast<int>(std::round(final_spot2_y));
-    result.spot2_temp = spot_left.temp;
-    
-    return result;
+    return true;
 }
 
-SDL_Color mapTemperature(float temp, float min_temp, float max_temp, 
-                         bool isolation_mode) {
-    SDL_Color color;
-    
-    float range = max_temp - min_temp;
-    if (range < 0.01f) {
-        color.r = 20; color.g = 20; color.b = 20; color.a = 255;
-        return color;
-    }
-    
-    float normalized;
-    
-    if (isolation_mode) {
-        // Only show top 15% of temperature range
-        float threshold = max_temp - (range * ISOLATION_THRESHOLD);
-        
-        if (temp < threshold) {
-            color.r = 0; color.g = 0; color.b = 0; color.a = 255;
-            return color;
-        }
-        
-        normalized = (temp - threshold) / (range * ISOLATION_THRESHOLD);
-    } else {
-        // Full relative range
-        normalized = (temp - min_temp) / range;
-    }
-    
-    // Apply power curve to expand lower values
-    normalized = std::pow(normalized, 0.15f);
-    
-    // Map to color gradient: Blue → Cyan → Green → Yellow → Red
-    if (normalized < 0.25f) {
-        float t = normalized * 4.0f;
-        color.r = 0;
-        color.g = static_cast<Uint8>(t * 255);
-        color.b = 255;
-    } else if (normalized < 0.5f) {
-        float t = (normalized - 0.25f) * 4.0f;
-        color.r = 0;
-        color.g = 255;
-        color.b = static_cast<Uint8>((1.0f - t) * 255);
-    } else if (normalized < 0.75f) {
-        float t = (normalized - 0.5f) * 4.0f;
-        color.r = static_cast<Uint8>(t * 255);
-        color.g = 255;
-        color.b = 0;
-    } else {
-        float t = (normalized - 0.75f) * 4.0f;
-        color.r = 255;
-        color.g = static_cast<Uint8>((1.0f - t) * 255);
-        color.b = 0;
-    }
-    
-    color.a = 255;
-    return color;
-}
-
-std::vector<std::vector<int>> findConnectedComponents(
-    std::vector<std::vector<bool>>& binary_map, int width, int height)
-{
-    std::vector<std::vector<int>> labels(height, std::vector<int>(width, 0));
-    int current_label = 1;
-
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            if (binary_map[y][x] && labels[y][x] == 0) {
-                // BFS flood fill
-                std::queue<std::pair<int, int>> queue;
-                queue.push(std::make_pair(x, y));
-                labels[y][x] = current_label;
-
-                while (!queue.empty()) {
-                    std::pair<int, int> current = queue.front();
-                    queue.pop();
-                    int cx = current.first;
-                    int cy = current.second;
-
-                    // 4-connected neighbors
-                    const int ddx[] = {-1, 1, 0, 0};
-                    const int ddy[] = {0, 0, -1, 1};
-
-                    for (int i = 0; i < 4; i++) {
-                        int nx = cx + ddx[i];
-                        int ny = cy + ddy[i];
-
-                        if (nx >= 0 && nx < width && ny >= 0 && ny < height &&
-                            binary_map[ny][nx] && labels[ny][nx] == 0) {
-                            labels[ny][nx] = current_label;
-                            queue.push(std::make_pair(nx, ny));
-                        }
-                    }
-                }
-                current_label++;
-            }
-        }
-    }
-    return labels;
-}
-
-SignatureScore analyzeSignaturePattern(float* temps, int width, int height,
-                                       const ThermalObject& obj) {
-    SignatureScore score;
-    score.gradient_quality = 0;
-    score.compactness = 0;
-    score.peak_centrality = 0;
-    score.aspect_ratio_score = 0;
-    score.circularity = 0;
-    score.overall_score = 0;
-    
-    // Reject extreme aspect ratios
-    float aspect_ratio = static_cast<float>(obj.width) / static_cast<float>(obj.height);
-    if (aspect_ratio > 3.0f || aspect_ratio < 0.33f) return score;
+// Find the main thermal blob using flood-fill from peak temperature
+ThermalBlob findMainBlob(float* temps, int width, int height, float min_temp, float max_temp) {
+    ThermalBlob blob = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, false};
     
     // Find peak temperature location
-    int peak_x = obj.x, peak_y = obj.y;
-    float peak_temp = -1000.0f;
-    
-    for (int y = obj.y; y < obj.y + obj.height && y < height; y++) {
-        for (int x = obj.x; x < obj.x + obj.width && x < width; x++) {
-            float temp = temps[y * width + x];
-            if (temp > peak_temp) {
-                peak_temp = temp;
+    int peak_x = 0, peak_y = 0;
+    float peak_val = min_temp;
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            if (temps[y * width + x] > peak_val) {
+                peak_val = temps[y * width + x];
                 peak_x = x;
                 peak_y = y;
             }
         }
     }
     
-    // Aspect ratio score (prefer square-ish)
-    score.aspect_ratio_score = std::max(0.0f, 1.0f - std::fabs(aspect_ratio - 1.0f) * 2.0f);
+    blob.peak_temp = peak_val;
     
-    // Peak centrality score
-    float center_x = obj.x + obj.width / 2.0f;
-    float center_y = obj.y + obj.height / 2.0f;
-    float peak_offset = std::sqrt(
-        std::pow(static_cast<float>(peak_x) - center_x, 2.0f) + 
-        std::pow(static_cast<float>(peak_y) - center_y, 2.0f));
-    float max_offset = std::sqrt(
-        std::pow(obj.width / 2.0f, 2.0f) + 
-        std::pow(obj.height / 2.0f, 2.0f));
-    score.peak_centrality = max_offset > 0 ? (1.0f - (peak_offset / max_offset)) : 1.0f;
+    // Threshold: midpoint between average and peak
+    float avg_temp = 0;
+    for (int i = 0; i < width * height; i++) avg_temp += temps[i];
+    avg_temp /= (width * height);
     
-    if (score.peak_centrality < 0.5f) return score;
+    float threshold = avg_temp + (peak_val - avg_temp) * 0.25f;
     
-    // Gradient quality - check temperature falloff in 8 directions
-    int directions[8][2] = {{0,-1},{1,-1},{1,0},{1,1},{0,1},{-1,1},{-1,0},{-1,-1}};
-    float gradient_scores[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    int valid_directions = 0;
+    // Find all connected hot pixels using simple region growing
+    float sum_x = 0, sum_y = 0, sum_w = 0;
+    float blob_min_x = static_cast<float>(width), blob_max_x = 0;
+    float blob_min_y = static_cast<float>(height), blob_max_y = 0;
+    int count = 0;
     
-    for (int dir = 0; dir < 8; dir++) {
-        int ddx = directions[dir][0];
-        int ddy = directions[dir][1];
-        float last_temp = peak_temp;
-        int consecutive_declines = 0, total_samples = 0;
-        float temp_drop_total = 0.0f;
+    std::vector<bool> visited(width * height, false);
+    std::vector<std::pair<int,int>> queue;
+    queue.push_back({peak_x, peak_y});
+    visited[peak_y * width + peak_x] = true;
+    
+    while (!queue.empty()) {
+        std::pair<int,int> p = queue.back();
+        queue.pop_back();
+        int x = p.first;
+        int y = p.second;
         
-        for (int step = 1; step <= 5; step++) {
-            int sample_x = peak_x + ddx * step;
-            int sample_y = peak_y + ddy * step;
-            
-            if (sample_x < 0 || sample_x >= width || sample_y < 0 || sample_y >= height) break;
-            if (sample_x < obj.x || sample_x >= obj.x + obj.width) break;
-            if (sample_y < obj.y || sample_y >= obj.y + obj.height) break;
-            
-            float sample_temp = temps[sample_y * width + sample_x];
-            if (sample_temp < last_temp) {
-                consecutive_declines++;
-                temp_drop_total += last_temp - sample_temp;
+        float t = temps[y * width + x];
+        if (t < threshold) continue;
+        
+        float w = (t - threshold) * (t - threshold);
+        sum_x += x * w;
+        sum_y += y * w;
+        sum_w += w;
+        count++;
+        
+        blob_min_x = std::min(blob_min_x, static_cast<float>(x));
+        blob_max_x = std::max(blob_max_x, static_cast<float>(x));
+        blob_min_y = std::min(blob_min_y, static_cast<float>(y));
+        blob_max_y = std::max(blob_max_y, static_cast<float>(y));
+        
+        // Add neighbors
+        const int dx[] = {-1, 1, 0, 0};
+        const int dy[] = {0, 0, -1, 1};
+        for (int d = 0; d < 4; d++) {
+            int nx = x + dx[d];
+            int ny = y + dy[d];
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                if (!visited[ny * width + nx]) {
+                    visited[ny * width + nx] = true;
+                    if (temps[ny * width + nx] >= threshold) {
+                        queue.push_back({nx, ny});
+                    }
+                }
             }
-            last_temp = sample_temp;
-            total_samples++;
-        }
-        
-        if (total_samples > 0) {
-            float decline_ratio = static_cast<float>(consecutive_declines) / total_samples;
-            float avg_drop = temp_drop_total / total_samples;
-            gradient_scores[dir] = decline_ratio * 0.7f + std::min(avg_drop / 2.0f, 1.0f) * 0.3f;
-            valid_directions++;
         }
     }
     
-    if (valid_directions > 0) {
-        float sum = 0;
-        for (int i = 0; i < 8; i++) sum += gradient_scores[i];
-        score.gradient_quality = sum / valid_directions;
+    if (sum_w > 0 && count > 10) {
+        blob.center_x = sum_x / sum_w;
+        blob.center_y = sum_y / sum_w;
+        blob.min_x = blob_min_x;
+        blob.max_x = blob_max_x;
+        blob.min_y = blob_min_y;
+        blob.max_y = blob_max_y;
+        blob.width = blob_max_x - blob_min_x;
+        blob.height = blob_max_y - blob_min_y;
+        blob.pixel_count = count;
+        blob.valid = true;
     }
     
-    if (score.gradient_quality < 0.4f) return score;
-    
-    // Circularity and compactness
-    int area = obj.width * obj.height;
-    int perimeter = 2 * (obj.width + obj.height);
-    score.circularity = std::min(
-        (4.0f * 3.14159f * area) / static_cast<float>(perimeter * perimeter), 1.0f);
-    
-    if (area < 9) score.compactness = 0.0f;
-    else if (area > 400) score.compactness = 0.3f;
-    else score.compactness = std::max(0.3f, 1.0f - std::fabs(area - 100.0f) / 100.0f);
-    
-    // Calculate overall weighted score
-    score.overall_score = score.gradient_quality * 0.40f + 
-                          score.peak_centrality * 0.25f +
-                          score.aspect_ratio_score * 0.15f + 
-                          score.circularity * 0.10f +
-                          score.compactness * 0.10f;
-    
-    return score;
+    return blob;
 }
 
-std::vector<ThermalObject> detectThermalObjects(float* temps, int width, 
-                                                 int height, int& next_id) {
-    std::vector<ThermalObject> objects;
+float findMainGridBottom(float* temps, int width, int height, const ThermalBlob& blob, float avg_temp, float max_temp) {
+    if (!blob.valid) return blob.max_y;
     
-    // Find temperature range
-    float min_temp = 1000.0f, max_temp = -1000.0f;
+    int y_min = static_cast<int>(blob.min_y);
+    int y_max = static_cast<int>(blob.max_y);
+    int x_min = static_cast<int>(blob.min_x);
+    int x_max = static_cast<int>(blob.max_x);
+    
+    int blob_height = y_max - y_min;
+    if (blob_height < 15) return blob.max_y;  // Too small
+    
+    // Calculate heat density per row
+    float hot_threshold = avg_temp + (max_temp - avg_temp) * 0.3f;
+    std::vector<int> row_hot_pixels(blob_height + 1, 0);
+    
+    for (int y = y_min; y <= y_max; y++) {
+        for (int x = x_min; x <= x_max; x++) {
+            if (temps[y * width + x] >= hot_threshold) {
+                row_hot_pixels[y - y_min]++;
+            }
+        }
+    }
+    
+    const int window = 3;
+    std::vector<float> smoothed(blob_height + 1, 0);
+    for (int i = 0; i <= blob_height; i++) {
+        float sum = 0;
+        int cnt = 0;
+        for (int j = std::max(0, i - window); j <= std::min(blob_height, i + window); j++) {
+            sum += row_hot_pixels[j];
+            cnt++;
+        }
+        smoothed[i] = sum / cnt;
+    }
+    
+    // Find significant drops in heat density from top
+    // A gap between main grid and anchors will show as a local minimum
+    float max_heat = 0;
+    for (int i = 0; i < static_cast<int>(blob_height * 0.6f); i++) {
+        max_heat = std::max(max_heat, smoothed[i]);
+    }
+    
+    if (max_heat < 3) return blob.max_y;  // No significant heat pattern
+    
+    int start_scan = static_cast<int>(blob_height * 0.5f);
+    float min_in_gap = max_heat;
+    int gap_row = -1;
+    
+    for (int i = start_scan; i <= blob_height; i++) {
+        if (smoothed[i] < max_heat * 0.25f) {
+            if (smoothed[i] < min_in_gap) {
+                min_in_gap = smoothed[i];
+                gap_row = i;
+            }
+        }
+    }
+    
+    if (gap_row > 0) {
+        bool found_heat_after_gap = false;
+        for (int i = gap_row; i <= blob_height; i++) {
+            if (smoothed[i] > max_heat * 0.4f) {
+                found_heat_after_gap = true;
+                break;
+            }
+        }
+        
+        if (found_heat_after_gap) {
+            return static_cast<float>(y_min + gap_row - 1);
+        }
+    }
+    
+    return static_cast<float>(y_min + static_cast<int>(blob_height * 0.8f));
+}
+
+void findCameraCircle(float* temps, int width, int height, ThermalBlob& blob, 
+                      float scale, float avg_temp, float max_temp) {
+    blob.cold_circle_found = false;
+    blob.cold_radius = 0;
+    
+    if (!blob.valid) return;
+    
+    // Expected radius based on physical size
+    float expected_radius = (CAMERA_HOLE_DIAMETER_CM / 2.0f) * scale;
+    expected_radius = std::max(3.0f, std::min(expected_radius, 25.0f));
+    
+    // Bounding box center
+    float bbox_center_x = (blob.min_x + blob.max_x) / 2.0f;
+    float bbox_center_y = (blob.min_y + blob.max_y) / 2.0f;
+    
+    // Temperature threshold
+    float temp_range = max_temp - avg_temp;
+    float hot_thresh = avg_temp + temp_range * 0.45f;
+    
+    float margin_x = blob.width * 0.25f;
+    float margin_y = blob.height * 0.25f;
+    
+    int sx_min = static_cast<int>(blob.min_x + margin_x);
+    int sx_max = static_cast<int>(blob.max_x - margin_x);
+    int sy_min = static_cast<int>(blob.min_y + margin_y);
+    int sy_max = static_cast<int>(blob.max_y - margin_y);
+    
+    // Ensure valid search region
+    sx_min = std::max(0, sx_min);
+    sx_max = std::min(width - 1, sx_max);
+    sy_min = std::max(0, sy_min);
+    sy_max = std::min(height - 1, sy_max);
+    
+    if (sx_max <= sx_min || sy_max <= sy_min) {
+        blob.cold_center_x = bbox_center_x;
+        blob.cold_center_y = bbox_center_y;
+        blob.cold_radius = expected_radius;
+        blob.cold_circle_found = true;
+        return;
+    }
+    
+    float coldest_temp = temps[sy_min * width + sx_min];
+    int coldest_x = static_cast<int>(bbox_center_x);
+    int coldest_y = static_cast<int>(bbox_center_y);
+    
+    for (int y = sy_min; y <= sy_max; y++) {
+        for (int x = sx_min; x <= sx_max; x++) {
+            float t = temps[y * width + x];
+            if (t < coldest_temp) {
+                coldest_temp = t;
+                coldest_x = x;
+                coldest_y = y;
+            }
+        }
+    }
+    
+    // Expand concentrically from coldest point to find circle edge
+    int cx = coldest_x;
+    int cy = coldest_y;
+    
+    int max_search_radius = static_cast<int>(expected_radius * 2.5f);
+    max_search_radius = std::min(max_search_radius, 25);
+    
+    int found_radius = 0;
+    
+    for (int r = 1; r <= max_search_radius; r++) {
+        int num_samples = std::max(8, r * 4);
+        int hot_count = 0;
+        int valid_count = 0;
+        
+        for (int i = 0; i < num_samples; i++) {
+            float angle = 2.0f * PI_F * i / num_samples;
+            int px = cx + static_cast<int>(r * std::cos(angle));
+            int py = cy + static_cast<int>(r * std::sin(angle));
+            
+            if (px < 0 || px >= width || py < 0 || py >= height) continue;
+            
+            valid_count++;
+            if (temps[py * width + px] >= hot_thresh) {
+                hot_count++;
+            }
+        }
+        
+        if (valid_count > 0 && hot_count > valid_count / 2) {
+            found_radius = r;
+            break;
+        }
+    }
+    
+    float final_radius = (found_radius > 2) ? static_cast<float>(found_radius) : expected_radius;
+    
+    // Refine center using weighted centroid of cold region
+    int search_r = static_cast<int>(final_radius * 1.2f);
+    float cold_thresh = coldest_temp + (hot_thresh - coldest_temp) * 0.4f;
+    
+    float sum_x = 0, sum_y = 0, sum_w = 0;
+    
+    for (int dy = -search_r; dy <= search_r; dy++) {
+        for (int dx = -search_r; dx <= search_r; dx++) {
+            if (dx*dx + dy*dy > search_r*search_r) continue;
+            int px = cx + dx, py = cy + dy;
+            if (px < 0 || px >= width || py < 0 || py >= height) continue;
+            
+            float t = temps[py * width + px];
+            if (t <= cold_thresh) {
+                float w = cold_thresh - t + 0.1f;
+                sum_x += px * w;
+                sum_y += py * w;
+                sum_w += w;
+            }
+        }
+    }
+    
+    if (sum_w > 0) {
+        blob.cold_center_x = sum_x / sum_w;
+        blob.cold_center_y = sum_y / sum_w;
+    } else {
+        blob.cold_center_x = static_cast<float>(coldest_x);
+        blob.cold_center_y = static_cast<float>(coldest_y);
+    }
+    
+    float final_margin_x = blob.width * 0.20f;
+    float final_margin_y = blob.height * 0.20f;
+    
+    blob.cold_center_x = std::max(blob.cold_center_x, blob.min_x + final_margin_x);
+    blob.cold_center_x = std::min(blob.cold_center_x, blob.max_x - final_margin_x);
+    blob.cold_center_y = std::max(blob.cold_center_y, blob.min_y + final_margin_y);
+    blob.cold_center_y = std::min(blob.cold_center_y, blob.max_y - final_margin_y);
+    
+    blob.cold_radius = final_radius;
+    blob.cold_circle_found = true;
+}
+
+std::vector<PCBGridSensor::HotSpot> PCBGridSensor::findHotSpots(
+    float* temps, int w, int h, float threshold, float scale) {
+    
+    std::vector<HotSpot> spots;
+    
+    int radius = static_cast<int>(scale * 0.25f);
+    radius = std::max(2, std::min(radius, 8));
+    
+    float min_separation = scale * 0.5f;  // Half the spacing to allow some overlap
+    min_separation = std::max(3.0f, min_separation);
+    
+    for (int y = radius; y < h - radius; y++) {
+        for (int x = radius; x < w - radius; x++) {
+            float center_temp = temps[y * w + x];
+            if (center_temp < threshold) continue;
+            
+            // Local maximum check with scale-dependent radius
+            bool is_max = true;
+            for (int dy = -radius; dy <= radius && is_max; dy++) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    if (temps[(y + dy) * w + (x + dx)] >= center_temp) {
+                        is_max = false;
+                        break;
+                    }
+                }
+            }
+            
+            if (!is_max) continue;
+            
+            // Check minimum separation from already found spots
+            bool too_close = false;
+            for (const auto& existing : spots) {
+                float dx = existing.x - x;
+                float dy = existing.y - y;
+                if (dx*dx + dy*dy < min_separation * min_separation) {
+                    if (center_temp <= existing.temperature) {
+                        too_close = true;
+                        break;
+                    }
+                }
+            }
+            if (too_close) continue;
+            
+            HotSpot spot;
+            spot.x = static_cast<float>(x);
+            spot.y = static_cast<float>(y);
+            spot.temperature = center_temp;
+            spots.push_back(spot);
+        }
+    }
+    
+    std::sort(spots.begin(), spots.end(),
+        [](const HotSpot& a, const HotSpot& b) { return a.temperature > b.temperature; });
+    
+    if (spots.size() > 60) spots.resize(60);
+    
+    return spots;
+}
+
+float PCBGridSensor::smooth(float raw, float& filtered, float alpha) {
+    filtered = alpha * raw + (1.0f - alpha) * filtered;
+    return filtered;
+}
+
+float PCBGridSensor::median(std::vector<float>& buffer, float new_val) {
+    buffer.push_back(new_val);
+    if (buffer.size() > MEDIAN_SIZE) buffer.erase(buffer.begin());
+    std::vector<float> sorted = buffer;
+    std::sort(sorted.begin(), sorted.end());
+    return sorted[sorted.size() / 2];
+}
+
+static void adaptiveSmoothCenter(float raw, float& filtered, float velocity) {
+    float alpha;
+    if (velocity < 0.5f) {
+        alpha = 0.08f;
+    } else if (velocity > 3.0f) {
+        alpha = 0.6f;   // Very responsive when moving
+    } else {
+        alpha = 0.08f + (velocity - 0.5f) / 2.5f * 0.52f;
+    }
+    filtered = alpha * raw + (1.0f - alpha) * filtered;
+}
+
+static void adaptiveSmoothScale(float raw, float& filtered, float velocity) {
+    float alpha;
+    if (velocity < 1.0f) {
+        alpha = 0.1f;
+    } else if (velocity > 3.0f) {
+        alpha = 0.4f;
+    } else {
+        alpha = 0.1f + (velocity - 1.0f) / 2.0f * 0.3f;
+    }
+    filtered = alpha * raw + (1.0f - alpha) * filtered;
+}
+
+void PCBGridSensor::matchDotsToGrid(const std::vector<HotSpot>& spots,
+                                     float center_x, float center_y, float scale,
+                                     std::vector<GridDot>& dots) {
+    dots = expected_dots_;
+    for (auto& d : dots) { 
+        d.detected = false; 
+        d.temperature = 0;
+        d.pixel_x = center_x + d.expected_x_cm * scale;
+        d.pixel_y = center_y + d.expected_y_cm * scale;
+    }
+    
+    if (scale < 2.0f) return;
+    
+    std::vector<bool> used(spots.size(), false);
+    float search_radius = std::max(6.0f, scale * 0.4f);
+    
+    for (size_t i = 0; i < dots.size(); i++) {
+        if (dots[i].anchor_id >= 0) continue;
+        
+        float exp_x = dots[i].pixel_x;
+        float exp_y = dots[i].pixel_y;
+        
+        float best_dist = search_radius;
+        int best_idx = -1;
+        
+        for (size_t j = 0; j < spots.size(); j++) {
+            if (used[j]) continue;
+            float dx = spots[j].x - exp_x;
+            float dy = spots[j].y - exp_y;
+            float dist = std::sqrt(dx*dx + dy*dy);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = static_cast<int>(j);
+            }
+        }
+        
+        if (best_idx >= 0) {
+            used[best_idx] = true;
+            dots[i].detected = true;
+            dots[i].temperature = spots[best_idx].temperature;
+            dots[i].pixel_x = spots[best_idx].x;
+            dots[i].pixel_y = spots[best_idx].y;
+        }
+    }
+}
+
+GridResult PCBGridSensor::detect(float* temps, int width, int height) {
+    GridResult result = {};
+    result.valid = false;
+    
+    float min_temp = temps[0], max_temp = temps[0];
     for (int i = 0; i < width * height; i++) {
         min_temp = std::min(min_temp, temps[i]);
         max_temp = std::max(max_temp, temps[i]);
     }
+    result.max_temp = max_temp;
     
-    float range = max_temp - min_temp;
-    if (range < 0.01f) return objects;
+    // Calculate average temperature early
+    float avg_temp = 0;
+    for (int i = 0; i < width * height; i++) avg_temp += temps[i];
+    avg_temp /= (width * height);
     
-    // Threshold at top 15%
-    float threshold = max_temp - (range * ISOLATION_THRESHOLD);
+    bool detection_succeeded = false;
+    ThermalBlob blob;
     
-    // Create binary map
-    std::vector<std::vector<bool>> hot_pixels(height, std::vector<bool>(width, false));
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            if (temps[y * width + x] >= threshold) {
-                hot_pixels[y][x] = true;
-            }
-        }
-    }
-    
-    // Find connected components
-    std::vector<std::vector<int>> labels = findConnectedComponents(hot_pixels, width, height);
-    
-    // Build objects from labels
-    std::map<int, ThermalObject> object_map;
-    
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int label = labels[y][x];
-            if (label > 0) {
-                if (object_map.find(label) == object_map.end()) {
-                    ThermalObject obj;
-                    obj.id = next_id++;
-                    obj.x = x;
-                    obj.y = y;
-                    obj.width = 0;
-                    obj.height = 0;
-                    obj.min_temp = 1000.0f;
-                    obj.max_temp = -1000.0f;
-                    obj.avg_temp = 0.0f;
-                    object_map[label] = obj;
-                }
-                
-                ThermalObject& obj = object_map[label];
-                obj.x = std::min(obj.x, x);
-                obj.y = std::min(obj.y, y);
-                obj.width = std::max(obj.width, x - obj.x + 1);
-                obj.height = std::max(obj.height, y - obj.y + 1);
-                
-                float temp = temps[y * width + x];
-                obj.min_temp = std::min(obj.min_temp, temp);
-                obj.max_temp = std::max(obj.max_temp, temp);
-            }
-        }
-    }
-    
-    // Score and filter objects
-    std::vector<std::pair<ThermalObject, SignatureScore>> scored;
-    
-    for (std::map<int, ThermalObject>::iterator it = object_map.begin(); 
-         it != object_map.end(); ++it) {
-        ThermalObject& obj = it->second;
+    if (max_temp - min_temp >= 3.0f) {
+        blob = findMainBlob(temps, width, height, min_temp, max_temp);
         
-        // Calculate average temperature
-        float sum = 0.0f;
-        int count = 0;
-        for (int y = obj.y; y < obj.y + obj.height && y < height; y++) {
-            for (int x = obj.x; x < obj.x + obj.width && x < width; x++) {
-                if (temps[y * width + x] >= threshold) {
-                    sum += temps[y * width + x];
-                    count++;
-                }
-            }
-        }
-        obj.avg_temp = count > 0 ? sum / count : obj.max_temp;
-        
-        SignatureScore sig_score = analyzeSignaturePattern(temps, width, height, obj);
-        if (sig_score.overall_score > 0.50f) {
-            scored.push_back(std::make_pair(obj, sig_score));
-        }
-    }
-    
-    // Sort by score (descending)
-    for (size_t i = 0; i < scored.size(); i++) {
-        for (size_t j = i + 1; j < scored.size(); j++) {
-            if (scored[j].second.overall_score > scored[i].second.overall_score) {
-                std::pair<ThermalObject, SignatureScore> tmp = scored[i];
-                scored[i] = scored[j];
-                scored[j] = tmp;
+        if (blob.valid && blob.width >= 10 && blob.height >= 5) {
+            if (validatePCBShape(blob, temps, width, height, avg_temp, max_temp)) {
+                detection_succeeded = true;
             }
         }
     }
     
-    // Return top 2 objects with color coding
-    for (size_t i = 0; i < scored.size() && i < 2; i++) {
-        ThermalObject obj = scored[i].first;
-        float score_val = scored[i].second.overall_score;
+    if (detection_succeeded) {
+        frames_since_detection_ = 0;
+        detection_confidence_ = 1.0f;
+    } else {
+        // No detection this frame
+        frames_since_detection_++;
         
-        if (score_val > 0.70f) {
-            obj.box_color.r = 0;
-            obj.box_color.g = 255;
-            obj.box_color.b = 0;
-            obj.box_color.a = 255;
-        } else if (score_val > 0.60f) {
-            obj.box_color.r = 255;
-            obj.box_color.g = 255;
-            obj.box_color.b = 0;
-            obj.box_color.a = 255;
+        // Decay confidence gradually
+        detection_confidence_ *= 0.85f;  // Lose 15% confidence per frame
+        
+        if (initialized_ && frames_since_detection_ <= MAX_HOLDOVER_FRAMES && detection_confidence_ > 0.1f) {
+            result.valid = true;
+            result.confidence = detection_confidence_;  // Show we're in holdover
+            result.distance_cm = filt_dist_;
+            result.yaw_deg = filt_yaw_;
+            result.pitch_deg = filt_pitch_;
+            result.pixels_per_cm = filt_scale_;
+            result.grid_center_x = filt_center_x_;
+            result.grid_center_y = filt_center_y_;
+            result.circle_found = true;
+            result.circle_radius = (CAMERA_HOLE_DIAMETER_CM / 2.0f) * filt_scale_;
+            result.main_grid_x_min = filt_x_min_;
+            result.main_grid_x_max = filt_x_max_;
+            result.main_grid_y_min = filt_y_min_;
+            result.main_grid_y_max = filt_y_max_;
+            result.grid_width_px = filt_x_max_ - filt_x_min_;
+            result.grid_height_px = filt_y_max_ - filt_y_min_;
+            result.hot_region_temp = max_temp;
+            return result;
+        }
+        return result;
+    }
+    
+    result.hot_region_temp = blob.peak_temp;
+
+    // Find where the main grid ends (before anchors)
+    float main_grid_bottom = findMainGridBottom(temps, width, height, blob, avg_temp, max_temp);
+    
+    if (main_grid_bottom < blob.max_y - 5) {
+        blob.max_y = main_grid_bottom;
+        blob.height = blob.max_y - blob.min_y;
+        blob.center_y = (blob.min_y + blob.max_y) / 2.0f;
+    }
+
+    float raw_scale;
+    float visible_width_cm;
+    float blob_aspect = blob.width / std::max(1.0f, blob.height);
+    
+    if (blob_aspect > 2.5f) {
+        visible_width_cm = GRID_PHYSICAL_WIDTH_CM * 0.85f;  // ~8.2cm
+    } else if (blob_aspect > 1.5f) {
+        visible_width_cm = GRID_PHYSICAL_WIDTH_CM * 0.7f;   // ~6.7cm
+    } else {
+        visible_width_cm = blob.height / (GRID_PHYSICAL_HEIGHT_CM / GRID_PHYSICAL_WIDTH_CM);
+        visible_width_cm = std::min(visible_width_cm, GRID_PHYSICAL_WIDTH_CM);
+    }
+    
+    raw_scale = blob.width / visible_width_cm;
+    raw_scale = std::max(2.0f, std::min(raw_scale, 40.0f));
+    
+    float scale_for_circle = (initialized_ && filt_scale_ > 2.0f) ? filt_scale_ : raw_scale;
+    
+    findCameraCircle(temps, width, height, blob, scale_for_circle, avg_temp, max_temp);
+    
+    float raw_center_x, raw_center_y;
+    
+    if (blob.cold_circle_found) {
+        raw_center_x = blob.cold_center_x;
+        raw_center_y = blob.cold_center_y;
+    } else {
+        // Fallback to blob centroid
+        raw_center_x = blob.center_x;
+        raw_center_y = blob.center_y;
+    }
+    
+    if (!initialized_) {
+        filt_scale_ = raw_scale;
+        filt_center_x_ = raw_center_x;
+        filt_center_y_ = raw_center_y;
+        prev_center_x_ = raw_center_x;
+        prev_center_y_ = raw_center_y;
+        velocity_ = 0;
+        filt_dist_ = focal_length_px_ / raw_scale / 2.0f;
+        filt_yaw_ = 0;
+        filt_pitch_ = 0;
+        // Initialize filtered bounds
+        filt_x_min_ = blob.min_x;
+        filt_x_max_ = blob.max_x;
+        filt_y_min_ = blob.min_y;
+        filt_y_max_ = blob.max_y;
+        initialized_ = true;
+    } else {
+        // Calculate instantaneous velocity
+        float dx = raw_center_x - prev_center_x_;
+        float dy = raw_center_y - prev_center_y_;
+        float instant_vel = std::sqrt(dx*dx + dy*dy);
+        
+        if (instant_vel > velocity_) {
+            velocity_ = 0.4f * instant_vel + 0.6f * velocity_;
         } else {
-            obj.box_color.r = 255;
-            obj.box_color.g = 150;
-            obj.box_color.b = 0;
-            obj.box_color.a = 255;
+            velocity_ = 0.02f * instant_vel + 0.98f * velocity_;  // Extremely slow decay
         }
         
-        objects.push_back(obj);
+        prev_center_x_ = raw_center_x;
+        prev_center_y_ = raw_center_y;
+        
+        float scale_ratio = raw_scale / filt_scale_;
+        if (scale_ratio < 0.75f || scale_ratio > 1.33f) {
+            raw_scale = filt_scale_;  // Keep old value
+        }
+        
+        raw_center_x = std::max(raw_center_x, blob.min_x + 5.0f);
+        raw_center_x = std::min(raw_center_x, blob.max_x - 5.0f);
+        raw_center_y = std::max(raw_center_y, blob.min_y + 3.0f);
+        raw_center_y = std::min(raw_center_y, blob.max_y - 3.0f);
+        
+        float center_jump = std::sqrt(
+            (raw_center_x - filt_center_x_) * (raw_center_x - filt_center_x_) +
+            (raw_center_y - filt_center_y_) * (raw_center_y - filt_center_y_));
+        
+        float max_jump = (velocity_ < 1.0f) ? 5.0f : (velocity_ < 3.0f) ? 15.0f : 30.0f;
+        
+        if (center_jump > max_jump) {
+            float blend = max_jump / center_jump;
+            raw_center_x = filt_center_x_ + (raw_center_x - filt_center_x_) * blend;
+            raw_center_y = filt_center_y_ + (raw_center_y - filt_center_y_) * blend;
+        }
+        
+        // Apply adaptive smoothing - different for scale vs center
+        adaptiveSmoothScale(raw_scale, filt_scale_, velocity_);
+        
+        float circle_alpha;
+        if (velocity_ < 0.5f) {
+            circle_alpha = 0.05f;
+        } else if (velocity_ > 3.0f) {
+            circle_alpha = 0.4f;
+        } else {
+            circle_alpha = 0.05f + (velocity_ - 0.5f) / 2.5f * 0.35f;
+        }
+        filt_center_x_ = circle_alpha * raw_center_x + (1.0f - circle_alpha) * filt_center_x_;
+        filt_center_y_ = circle_alpha * raw_center_y + (1.0f - circle_alpha) * filt_center_y_;
+        
+        adaptiveSmoothScale(blob.min_x, filt_x_min_, velocity_);
+        adaptiveSmoothScale(blob.max_x, filt_x_max_, velocity_);
+        adaptiveSmoothScale(blob.min_y, filt_y_min_, velocity_);
+        adaptiveSmoothScale(blob.max_y, filt_y_max_, velocity_);
+    }
+    static const float DISTANCE_CALIBRATION = 1.57273f;  // Adjust based on testing
+    
+    float optical_distance = focal_length_px_ / filt_scale_;
+    float raw_distance = (optical_distance / 2.0f) * DISTANCE_CALIBRATION;
+    
+    // Smooth distance with median filter for extra stability
+    float med_distance = median(dist_buffer_, raw_distance);
+    adaptiveSmoothScale(med_distance, filt_dist_, velocity_);
+    
+    // Yaw: horizontal offset from center
+    float offset_x = filt_center_x_ - (width / 2.0f);
+    float raw_yaw = (offset_x / (width / 2.0f)) * (HFOV_DEGREES / 2.0f);
+    float med_yaw = median(yaw_buffer_, raw_yaw);
+    adaptiveSmoothCenter(med_yaw, filt_yaw_, velocity_);
+    
+    // Pitch: vertical offset from center
+    float offset_y = filt_center_y_ - (height / 2.0f);
+    float raw_pitch = (offset_y / (height / 2.0f)) * (vfov_degrees_ / 2.0f);
+    float med_pitch = median(pitch_buffer_, raw_pitch);
+    adaptiveSmoothCenter(med_pitch, filt_pitch_, velocity_);
+    
+    result.confidence = 1.0f;  // Fresh detection = full confidence
+    result.distance_cm = filt_dist_;
+    result.yaw_deg = filt_yaw_;
+    result.pitch_deg = filt_pitch_;
+    result.pixels_per_cm = filt_scale_;
+    result.hot_region_temp = blob.peak_temp;
+    
+    result.grid_center_x = filt_center_x_;
+    result.grid_center_y = filt_center_y_;
+    
+    result.circle_found = blob.cold_circle_found;
+    result.circle_radius = (CAMERA_HOLE_DIAMETER_CM / 2.0f) * filt_scale_;
+    
+    result.main_grid_x_min = filt_x_min_;
+    result.main_grid_x_max = filt_x_max_;
+    result.main_grid_y_min = filt_y_min_;
+    result.main_grid_y_max = filt_y_max_;
+    result.grid_width_px = filt_x_max_ - filt_x_min_;
+    result.grid_height_px = filt_y_max_ - filt_y_min_;
+    
+    float spot_threshold = avg_temp + (max_temp - avg_temp) * 0.15f;
+    std::vector<HotSpot> spots = findHotSpots(temps, width, height, spot_threshold, filt_scale_);
+    
+    std::vector<HotSpot> blob_spots;
+    float margin = 5.0f;
+    for (const auto& s : spots) {
+        if (s.x >= blob.min_x - margin && s.x <= blob.max_x + margin &&
+            s.y >= blob.min_y - margin && s.y <= blob.max_y + margin) {
+            blob_spots.push_back(s);
+        }
     }
     
-    return objects;
+    matchDotsToGrid(blob_spots, filt_center_x_, filt_center_y_, filt_scale_, result.dots);
+    
+    int main_detected = 0;
+    for (const auto& d : result.dots) {
+        if (d.anchor_id < 0 && d.detected) main_detected++;
+    }
+    result.main_dots_detected = main_detected;
+    result.total_dots_detected = main_detected;
+    result.num_main_rows = 3;  // Assume 3 rows if blob valid
+    
+    result.valid = true;
+    
+    return result;
+}
+
+SDL_Color mapTemperature(float temp, float min_temp, float max_temp, bool isolation) {
+    float range = max_temp - min_temp;
+    if (range < 1.0f) range = 1.0f;
+    float norm = (temp - min_temp) / range;
+    norm = std::max(0.0f, std::min(1.0f, norm));
+    
+    float enhanced = norm * norm * (3.0f - 2.0f * norm);
+    
+    if (isolation) {
+        if (enhanced < 0.7f) return {0, 0, static_cast<Uint8>(enhanced * 100), 255};
+        float hot = (enhanced - 0.7f) / 0.3f;
+        return {static_cast<Uint8>(255 * hot), static_cast<Uint8>(100 * hot), 0, 255};
+    }
+    
+    SDL_Color c;
+    if (enhanced < 0.25f) {
+        float t = enhanced / 0.25f;
+        c.r = static_cast<Uint8>(t * 80);
+        c.g = 0;
+        c.b = static_cast<Uint8>(50 + t * 130);
+    } else if (enhanced < 0.5f) {
+        float t = (enhanced - 0.25f) / 0.25f;
+        c.r = static_cast<Uint8>(80 + t * 175);
+        c.g = static_cast<Uint8>(t * 50);
+        c.b = static_cast<Uint8>(180 - t * 100);
+    } else if (enhanced < 0.75f) {
+        float t = (enhanced - 0.5f) / 0.25f;
+        c.r = 255;
+        c.g = static_cast<Uint8>(50 + t * 150);
+        c.b = static_cast<Uint8>(80 - t * 80);
+    } else {
+        float t = (enhanced - 0.75f) / 0.25f;
+        c.r = 255;
+        c.g = static_cast<Uint8>(200 + t * 55);
+        c.b = static_cast<Uint8>(t * 150);
+    }
+    c.a = 255;
+    return c;
+}
+
+SDL_Color mapTemperatureSharp(float temp, float sharpened, float min_temp, float max_temp, bool isolation) {
+    return mapTemperature(sharpened, min_temp, max_temp, isolation);
+}
+
+void sharpenFrame(float* input, float* output, int width, int height, float strength) {
+    for (int y = 1; y < height - 1; y++) {
+        for (int x = 1; x < width - 1; x++) {
+            float center = input[y * width + x];
+            float neighbors = (
+                input[(y-1) * width + x] +
+                input[(y+1) * width + x] +
+                input[y * width + (x-1)] +
+                input[y * width + (x+1)]
+            ) / 4.0f;
+            output[y * width + x] = center + strength * (center - neighbors);
+        }
+    }
+    for (int x = 0; x < width; x++) {
+        output[x] = input[x];
+        output[(height-1) * width + x] = input[(height-1) * width + x];
+    }
+    for (int y = 0; y < height; y++) {
+        output[y * width] = input[y * width];
+        output[y * width + (width-1)] = input[y * width + (width-1)];
+    }
 }
 
 } // namespace thermal
