@@ -252,7 +252,7 @@ void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_large,
         // Dot position
         float max_yaw = 28.0f;
         float max_pitch = 22.0f;
-        int dot_x = bcx + static_cast<int>((result.yaw_deg / max_yaw) * (box_size / 2));
+        int dot_x = bcx - static_cast<int>((result.yaw_deg / max_yaw) * (box_size / 2));
         int dot_y = bcy - static_cast<int>((result.pitch_deg / max_pitch) * (box_size / 2));
         
         dot_x = std::max(box_x + 2, std::min(box_x + box_size - 2, dot_x));
