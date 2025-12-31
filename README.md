@@ -12,6 +12,8 @@ This system measures distance to glass surfaces by detecting the thermal reflect
 
 ![UI Screenshot](assets/screenshot-ui.png)
 
+https://github.com/user-attachments/assets/c44d9d2f-90ef-4afc-8109-a14258313cbb
+
 ### Key Features
 
 - **Real-time distance measurement** using blob-based scale estimation
