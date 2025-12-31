@@ -1,4 +1,4 @@
-# PCB Grid Thermal Distance Sensor
+# Glass Ranging System using SeekThermal Cameras
 
 A thermal imaging system for measuring distance and orientation to glass surfaces using a custom heat emitter grid and computer vision algorithms.
 
@@ -11,6 +11,8 @@ A thermal imaging system for measuring distance and orientation to glass surface
 This system measures distance to glass surfaces by detecting the thermal reflection of a known emitter pattern. Glass is opaque to longwave infrared radiation, causing the heat signature to be reflected. By analyzing the apparent size and position of the reflected pattern, the system calculates distance and camera orientation in real-time.
 
 ![UI Screenshot](assets/screenshot-ui.png)
+
+https://github.com/user-attachments/assets/c44d9d2f-90ef-4afc-8109-a14258313cbb
 
 ### Key Features
 
