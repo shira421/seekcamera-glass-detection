@@ -1,6 +1,6 @@
 /**
  * @file rendering.cpp
- * @brief Implementation of rendering functions for grid visualization
+ * @brief Implementation of rendering functions for 45-dot grid visualization
  */
 
 #include "rendering.h"
@@ -163,7 +163,7 @@ void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_large,
             static_cast<Uint8>(green.b * result.confidence),
             255
         };
-        snprintf(buf, sizeof(buf), "%.2f cm", result.distance_cm);
+        snprintf(buf, sizeof(buf), "%.1f mm", result.distance_mm);
         renderText(renderer, font_large, buf, sidebar_x + 15, y, dist_color);
         y += 50;
         
@@ -189,7 +189,7 @@ void drawSidebar(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* font_large,
         renderText(renderer, font, buf, sidebar_x + 20, y, rows_color);
         y += 18;
         
-        snprintf(buf, sizeof(buf), "Scale: %.1f px/cm", result.pixels_per_cm);
+        snprintf(buf, sizeof(buf), "Scale: %.2f px/mm", result.pixels_per_mm);
         renderText(renderer, font, buf, sidebar_x + 20, y, gray);
         y += 18;
         

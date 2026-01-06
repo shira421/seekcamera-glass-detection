@@ -96,7 +96,7 @@ struct GridResult {
     bool valid;             // Detection successful?
     
     // Measurements
-    float distance_cm;      // Distance to glass surface
+    float distance_mm;      // Distance to glass surface in millimeters
     float yaw_deg;          // Camera yaw (+ = pointing right)
     float pitch_deg;        // Camera pitch (+ = pointing up)
     
@@ -106,7 +106,7 @@ struct GridResult {
     // Grid info
     float grid_width_px;    // Detected grid width in pixels
     float grid_height_px;   // Detected grid height in pixels
-    float pixels_per_cm;    // Scale factor
+    float pixels_per_mm;    // Scale factor
     float grid_center_x;    // Grid center X in image (camera position)
     float grid_center_y;    // Grid center Y in image
     

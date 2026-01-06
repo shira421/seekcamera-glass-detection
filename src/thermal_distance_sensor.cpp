@@ -11,8 +11,8 @@
 static const float PI_F = 3.14159265f;
 
 // Physical grid dimensions (known constants)
-static const float GRID_PHYSICAL_WIDTH_CM = 9.6f;
-static const float GRID_PHYSICAL_HEIGHT_CM = 2.4f;
+static const float GRID_PHYSICAL_WIDTH_CM = 9.6f;   // 12 columns × 0.8cm
+static const float GRID_PHYSICAL_HEIGHT_CM = 2.4f;  // 2 row gaps × 1.2cm
 static const float CAMERA_HOLE_DIAMETER_CM = 0.8f;
 
 namespace thermal {
@@ -176,11 +176,9 @@ bool validatePCBShape(const ThermalBlob& blob, float* temps, int width, int heig
     return true;
 }
 
-// Find the main thermal blob using flood-fill from peak temperature
 ThermalBlob findMainBlob(float* temps, int width, int height, float min_temp, float max_temp) {
     ThermalBlob blob = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, false};
     
-    // Find peak temperature location
     int peak_x = 0, peak_y = 0;
     float peak_val = min_temp;
     for (int y = 0; y < height; y++) {
@@ -195,7 +193,7 @@ ThermalBlob findMainBlob(float* temps, int width, int height, float min_temp, fl
     
     blob.peak_temp = peak_val;
     
-    // Threshold: midpoint between average and peak
+    // Threshold: midpoint between average and peak (adaptive)
     float avg_temp = 0;
     for (int i = 0; i < width * height; i++) avg_temp += temps[i];
     avg_temp /= (width * height);
@@ -359,7 +357,9 @@ void findCameraCircle(float* temps, int width, int height, ThermalBlob& blob,
     float temp_range = max_temp - avg_temp;
     float hot_thresh = avg_temp + temp_range * 0.45f;
     
-    float margin_x = blob.width * 0.25f;
+    // CONSTRAINT: Only search in the central 50% of the blob
+    // This prevents finding cold corners/edges
+    float margin_x = blob.width * 0.25f;   // 25% margin on each side = 50% center
     float margin_y = blob.height * 0.25f;
     
     int sx_min = static_cast<int>(blob.min_x + margin_x);
@@ -478,8 +478,12 @@ std::vector<PCBGridSensor::HotSpot> PCBGridSensor::findHotSpots(
     
     std::vector<HotSpot> spots;
     
-    int radius = static_cast<int>(scale * 0.25f);
-    radius = std::max(2, std::min(radius, 8));
+    // Scale-dependent radius for local maximum check
+    // At normal distance (scale ~10 px/cm), use radius 2-3
+    // At close distance (scale ~25 px/cm), emitters are spread out more, use larger radius
+    // At far distance (scale ~5 px/cm), emitters are close together, use smaller radius
+    int radius = static_cast<int>(scale * 0.25f);  // ~0.25cm in pixels
+    radius = std::max(2, std::min(radius, 8));     // Clamp between 2 and 8
     
     float min_separation = scale * 0.5f;  // Half the spacing to allow some overlap
     min_separation = std::max(3.0f, min_separation);
@@ -549,7 +553,7 @@ float PCBGridSensor::median(std::vector<float>& buffer, float new_val) {
 static void adaptiveSmoothCenter(float raw, float& filtered, float velocity) {
     float alpha;
     if (velocity < 0.5f) {
-        alpha = 0.08f;
+        alpha = 0.08f;  // Smooth when stationary to prevent jitter
     } else if (velocity > 3.0f) {
         alpha = 0.6f;   // Very responsive when moving
     } else {
@@ -561,9 +565,9 @@ static void adaptiveSmoothCenter(float raw, float& filtered, float velocity) {
 static void adaptiveSmoothScale(float raw, float& filtered, float velocity) {
     float alpha;
     if (velocity < 1.0f) {
-        alpha = 0.1f;
+        alpha = 0.1f;   // More responsive when still
     } else if (velocity > 3.0f) {
-        alpha = 0.4f;
+        alpha = 0.4f;   // Quick when moving
     } else {
         alpha = 0.1f + (velocity - 1.0f) / 2.0f * 0.3f;
     }
@@ -658,10 +662,10 @@ GridResult PCBGridSensor::detect(float* temps, int width, int height) {
         if (initialized_ && frames_since_detection_ <= MAX_HOLDOVER_FRAMES && detection_confidence_ > 0.1f) {
             result.valid = true;
             result.confidence = detection_confidence_;  // Show we're in holdover
-            result.distance_cm = filt_dist_;
+            result.distance_mm = filt_dist_ * 10.0f;  // Convert cm to mm
             result.yaw_deg = filt_yaw_;
             result.pitch_deg = filt_pitch_;
-            result.pixels_per_cm = filt_scale_;
+            result.pixels_per_mm = filt_scale_ / 10.0f;  // Convert px/cm to px/mm
             result.grid_center_x = filt_center_x_;
             result.grid_center_y = filt_center_y_;
             result.circle_found = true;
@@ -680,7 +684,6 @@ GridResult PCBGridSensor::detect(float* temps, int width, int height) {
     
     result.hot_region_temp = blob.peak_temp;
 
-    // Find where the main grid ends (before anchors)
     float main_grid_bottom = findMainGridBottom(temps, width, height, blob, avg_temp, max_temp);
     
     if (main_grid_bottom < blob.max_y - 5) {
@@ -773,14 +776,13 @@ GridResult PCBGridSensor::detect(float* temps, int width, int height) {
             raw_center_y = filt_center_y_ + (raw_center_y - filt_center_y_) * blend;
         }
         
-        // Apply adaptive smoothing - different for scale vs center
         adaptiveSmoothScale(raw_scale, filt_scale_, velocity_);
         
         float circle_alpha;
         if (velocity_ < 0.5f) {
-            circle_alpha = 0.05f;
+            circle_alpha = 0.05f;  // Very smooth when stationary
         } else if (velocity_ > 3.0f) {
-            circle_alpha = 0.4f;
+            circle_alpha = 0.4f;   // Responsive when moving fast
         } else {
             circle_alpha = 0.05f + (velocity_ - 0.5f) / 2.5f * 0.35f;
         }
@@ -792,7 +794,7 @@ GridResult PCBGridSensor::detect(float* temps, int width, int height) {
         adaptiveSmoothScale(blob.min_y, filt_y_min_, velocity_);
         adaptiveSmoothScale(blob.max_y, filt_y_max_, velocity_);
     }
-    static const float DISTANCE_CALIBRATION = 1.57273f;  // Adjust based on testing
+    static const float DISTANCE_CALIBRATION = 1.78723f;  // Adjust based on testing
     
     float optical_distance = focal_length_px_ / filt_scale_;
     float raw_distance = (optical_distance / 2.0f) * DISTANCE_CALIBRATION;
@@ -813,11 +815,11 @@ GridResult PCBGridSensor::detect(float* temps, int width, int height) {
     float med_pitch = median(pitch_buffer_, raw_pitch);
     adaptiveSmoothCenter(med_pitch, filt_pitch_, velocity_);
     
-    result.confidence = 1.0f;  // Fresh detection = full confidence
-    result.distance_cm = filt_dist_;
+    result.confidence = 1.0f;
+    result.distance_mm = filt_dist_ * 10.0f;  // Convert cm to mm
     result.yaw_deg = filt_yaw_;
     result.pitch_deg = filt_pitch_;
-    result.pixels_per_cm = filt_scale_;
+    result.pixels_per_mm = filt_scale_ / 10.0f;  // Convert px/cm to px/mm
     result.hot_region_temp = blob.peak_temp;
     
     result.grid_center_x = filt_center_x_;

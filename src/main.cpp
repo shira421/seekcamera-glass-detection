@@ -297,8 +297,8 @@ int main(int, char**) {
                 if (result.valid) {
                     auto now = std::chrono::steady_clock::now();
                     if (now - last_print >= print_interval) {
-                        std::cout << "\rDist: " << std::fixed << std::setprecision(2)
-                                  << result.distance_cm << " cm"
+                        std::cout << "\rDist: " << std::fixed << std::setprecision(1)
+                                  << result.distance_mm << " mm"
                                   << " | Yaw: " << std::setw(6) << result.yaw_deg << " deg"
                                   << " | Pitch: " << std::setw(6) << result.pitch_deg << " deg"
                                   << " | " << result.main_dots_detected << " dots"
