@@ -219,7 +219,7 @@ alpha = 0.05 (stationary) → 0.4 (fast motion)
 | Detection Latency | <100 ms typical |
 | Distance Range | 5-100+ cm |
 | Angular Range | ±28° yaw, ±22° pitch |
-| Distance Accuracy | ±2 cm typical (after calibration) |
+| Distance Accuracy | ±0.3 cm typical (after calibration) |
 
 ## API Reference
 
