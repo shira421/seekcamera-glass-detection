@@ -9,6 +9,7 @@ set(SOURCES
     src/main.cpp
     src/thermal_distance_sensor.cpp
     src/rendering.cpp
+    src/map_view.cpp
 )
 
 # Include directories

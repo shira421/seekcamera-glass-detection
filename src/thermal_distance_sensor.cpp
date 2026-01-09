@@ -357,9 +357,8 @@ void findCameraCircle(float* temps, int width, int height, ThermalBlob& blob,
     float temp_range = max_temp - avg_temp;
     float hot_thresh = avg_temp + temp_range * 0.45f;
     
-    // CONSTRAINT: Only search in the central 50% of the blob
     // This prevents finding cold corners/edges
-    float margin_x = blob.width * 0.25f;   // 25% margin on each side = 50% center
+    float margin_x = blob.width * 0.25f;
     float margin_y = blob.height * 0.25f;
     
     int sx_min = static_cast<int>(blob.min_x + margin_x);
@@ -478,10 +477,6 @@ std::vector<PCBGridSensor::HotSpot> PCBGridSensor::findHotSpots(
     
     std::vector<HotSpot> spots;
     
-    // Scale-dependent radius for local maximum check
-    // At normal distance (scale ~10 px/cm), use radius 2-3
-    // At close distance (scale ~25 px/cm), emitters are spread out more, use larger radius
-    // At far distance (scale ~5 px/cm), emitters are close together, use smaller radius
     int radius = static_cast<int>(scale * 0.25f);  // ~0.25cm in pixels
     radius = std::max(2, std::min(radius, 8));     // Clamp between 2 and 8
     
@@ -644,7 +639,22 @@ GridResult PCBGridSensor::detect(float* temps, int width, int height) {
         
         if (blob.valid && blob.width >= 10 && blob.height >= 5) {
             if (validatePCBShape(blob, temps, width, height, avg_temp, max_temp)) {
-                detection_succeeded = true;
+                // Check if blob touches any edge - if so, fail detection but record edge info
+                bool touches_left = blob.min_x < 8;
+                bool touches_right = blob.max_x > width - 8;
+                bool touches_top = blob.min_y < 8;
+                bool touches_bottom = blob.max_y > height - 8;
+                
+                if (!touches_left && !touches_right && !touches_top && !touches_bottom) {
+                    detection_succeeded = true;
+                } else {
+                    result.edge_left = touches_right;   // Mirrored
+                    result.edge_right = touches_left;   // Mirrored
+                    result.edge_top = touches_top;
+                    result.edge_bottom = touches_bottom;
+                    result.edge_distance_mm = filt_dist_ * 10.0f;
+                    result.edge_yaw_deg = filt_yaw_;
+                }
             }
         }
     }
@@ -755,9 +765,15 @@ GridResult PCBGridSensor::detect(float* temps, int width, int height) {
         prev_center_y_ = raw_center_y;
         
         float scale_ratio = raw_scale / filt_scale_;
-        if (scale_ratio < 0.75f || scale_ratio > 1.33f) {
-            raw_scale = filt_scale_;  // Keep old value
+        if (scale_ratio < 0.5f || scale_ratio > 2.0f) {
+            // Very large change - accept immediately (fast movement)
+            filt_scale_ = raw_scale;
+            filt_dist_ = focal_length_px_ / raw_scale / 2.0f;
+        } else if (scale_ratio < 0.75f || scale_ratio > 1.33f) {
+            // Moderate change - blend quickly
+            filt_scale_ = 0.5f * raw_scale + 0.5f * filt_scale_;
         }
+        // Small changes handled by adaptiveSmoothScale below
         
         raw_center_x = std::max(raw_center_x, blob.min_x + 5.0f);
         raw_center_x = std::min(raw_center_x, blob.max_x - 5.0f);
@@ -856,6 +872,53 @@ GridResult PCBGridSensor::detect(float* temps, int width, int height) {
     result.main_dots_detected = main_detected;
     result.total_dots_detected = main_detected;
     result.num_main_rows = 3;  // Assume 3 rows if blob valid
+    
+    float left_extent = filt_center_x_ - blob.min_x;
+    float right_extent = blob.max_x - filt_center_x_;
+    float top_extent = filt_center_y_ - blob.min_y;
+    float bottom_extent = blob.max_y - filt_center_y_;
+    
+    float expected_half_width = (GRID_PHYSICAL_WIDTH_CM / 2.0f) * filt_scale_;
+    float expected_half_height = (GRID_PHYSICAL_HEIGHT_CM / 2.0f) * filt_scale_;
+    
+    const float ASYMMETRY_THRESHOLD = 0.95f;
+    
+    bool asymmetry_detected = false;
+    
+    if (left_extent < expected_half_width * ASYMMETRY_THRESHOLD && 
+        right_extent > left_extent * 1.5f) {
+        result.edge_right = true;
+        result.edge_distance_mm = filt_dist_ * 10.0f;
+        result.edge_yaw_deg = filt_yaw_;
+        asymmetry_detected = true;
+    }
+    if (right_extent < expected_half_width * ASYMMETRY_THRESHOLD && 
+        left_extent > right_extent * 1.5f) {
+        result.edge_left = true;
+        result.edge_distance_mm = filt_dist_ * 10.0f;
+        result.edge_yaw_deg = filt_yaw_;
+        asymmetry_detected = true;
+    }
+    
+    if (top_extent < expected_half_height * ASYMMETRY_THRESHOLD && 
+        bottom_extent > top_extent * 1.5f) {
+        result.edge_top = true;
+        result.edge_distance_mm = filt_dist_ * 10.0f;
+        result.edge_yaw_deg = filt_yaw_;
+        asymmetry_detected = true;
+    }
+    if (bottom_extent < expected_half_height * ASYMMETRY_THRESHOLD && 
+        top_extent > bottom_extent * 1.5f) {
+        result.edge_bottom = true;
+        result.edge_distance_mm = filt_dist_ * 10.0f;
+        result.edge_yaw_deg = filt_yaw_;
+        asymmetry_detected = true;
+    }
+    
+    if (asymmetry_detected) {
+        result.valid = false;
+        return result;
+    }
     
     result.valid = true;
     

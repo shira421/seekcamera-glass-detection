@@ -5,6 +5,7 @@
 
 #include "thermal_distance_sensor.h"
 #include "rendering.h"
+#include "map_view.h"
 
 #include <csignal>
 #include <cstdio>
@@ -176,6 +177,10 @@ int main(int, char**) {
     // Create sensor instance
     PCBGridSensor sensor;
     
+    // Create map view window
+    MapView mapView;
+    bool mapViewInitialized = false;
+    
     // Rate limiting for terminal output
     auto last_print = std::chrono::steady_clock::now();
     const auto print_interval = std::chrono::milliseconds(200);
@@ -310,8 +315,22 @@ int main(int, char**) {
                 drawSidebar(r->renderer, r->font, r->font_large,
                             result, r->isolation_mode, ww, wh);
                 
-                // Present
+                // Present main window
                 SDL_RenderPresent(r->renderer);
+                
+                // Initialize map view on first valid detection
+                if (!mapViewInitialized && result.valid) {
+                    if (mapView.init(400, 500)) {
+                        mapViewInitialized = true;
+                        std::cout << "\nMap view window opened" << std::endl;
+                    }
+                }
+                
+                // Update and render map view
+                if (mapViewInitialized && mapView.isOpen()) {
+                    mapView.update(result);
+                    mapView.render();
+                }
                 
                 // Unlock frame
                 seekcamera_frame_unlock(r->frame);

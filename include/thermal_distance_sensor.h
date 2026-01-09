@@ -128,6 +128,14 @@ struct GridResult {
     float max_temp;
     float hot_region_temp;
     
+    // Edge detection - indicates glass boundary detected
+    bool edge_left;         // Glass edge detected on left (blob touched right of frame)
+    bool edge_right;        // Glass edge detected on right (blob touched left of frame)
+    bool edge_top;          // Glass edge detected above
+    bool edge_bottom;       // Glass edge detected below
+    float edge_distance_mm; // Distance when edge was detected (for positioning)
+    float edge_yaw_deg;     // Yaw when edge was detected
+    
     // All 45 dot positions (detected or expected)
     std::vector<GridDot> dots;
     
